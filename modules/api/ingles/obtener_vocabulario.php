@@ -7,7 +7,7 @@
 
 session_start();
 header('Content-Type: application/json');
-include '../../../config/database.php';
+require_once __DIR__ . '/../../../config/database.php';
 
 $nivel = $_GET['nivel'] ?? '';
 $categoria = $_GET['categoria'] ?? '';

@@ -1,7 +1,7 @@
 <?php
 // api/exportar_reporte.php
 session_start();
-include '../../../config/database.php';
+require_once __DIR__ . '/../../../config/database.php';
 
 if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'director'])) {
     exit('No autorizado');

@@ -1,9 +1,9 @@
 <?php
 session_start();
-require '../../config/database.php';
+require_once __DIR__ . '/../../config/database.php';
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'estudiante') {
-    header("Location: ../../login.php");
+    header("Location: " . BASE_URL . "/login.php");
     exit;
 }
 

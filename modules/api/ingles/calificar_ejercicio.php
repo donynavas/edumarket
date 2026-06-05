@@ -7,7 +7,7 @@
 
 session_start();
 header('Content-Type: application/json');
-include '../../../config/database.php';
+require_once __DIR__ . '/../../../config/database.php';
 
 if (!isset($_SESSION['user_id'])) {
     echo json_encode([

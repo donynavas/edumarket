@@ -1,6 +1,6 @@
 <?php
 session_start();
-include '../../config/database.php';
+require_once __DIR__ . '/../../config/database.php';
 
 // ========================================
 // CONFIGURACIÓN Y VALIDACIÓN INICIAL
@@ -8,7 +8,7 @@ include '../../config/database.php';
 
 // Verificar sesión y rol
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
-    header("Location: ../../login.php");
+    header("Location: " . BASE_URL . "/login.php");
     exit;
 }
 
@@ -36,7 +36,7 @@ $id_profesor = $profesor['id_profesor'] ?? 0;
 
 if (!$id_profesor) {
     $_SESSION['error'] = "Perfil de profesor no encontrado";
-    header("Location: ../../logout.php");
+    header("Location: " . BASE_URL . "/logout.php");
     exit;
 }
 

@@ -1,10 +1,11 @@
 <?php
-//session_start();
-include 'config/database.php';
+session_start();
+require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/app.php';
 
 // Verificar que sea admin
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'admin') {
-    header("Location: ../login.php");
+    header("Location: " . BASE_URL . "/login.php");
     exit;
 }
 

@@ -1,6 +1,6 @@
 <?php
 // Verificar sesión y permisos antes de cargar
-include '../../config/database.php';
+require_once __DIR__ . '/../../config/database.php';
 // Obtener datos del examen desde $id_examen
 $tiempo_limite = 30; // Minutos, venir de BD
 ?>

@@ -1,6 +1,6 @@
 <?php
 session_start();
-include '../../../config/database.php';
+require_once __DIR__ . '/../../../config/database.php';
 if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'director'])) { 
     http_response_code(403); 
     echo json_encode(['success'=>false,'message'=>'No autorizado']); 

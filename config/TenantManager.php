@@ -1,60 +1,107 @@
 <?php
-// config/TenantManager.php
+// config/TenantManager.php — Multi-tenant compatible con localhost y subdominios
 
 class TenantManager {
-    private static $currentTenant = null;
+    private static ?array $currentTenant = null;
+    private static bool   $resolved      = false;
 
-    /**
-     * Detecta la institución basándose en el subdominio
-     */
-    public static function resolve($db) {
-    if (self::$currentTenant) return self::$currentTenant;
+    public static function resolve(PDO $db): ?array {
+        if (self::$resolved) return self::$currentTenant;
+        self::$resolved = true;
 
-    $host = $_SERVER['HTTP_HOST'];
-    $parts = explode('.', $host);
-    $subdomain = $parts[0];
-
-    // Si es localhost o IP directa, permitir acceso sin institución
-    if ($subdomain === 'localhost' || $subdomain === '127.0.0.1') {
-        // Solo requerir institución si NO es página de bienvenida o login
-        $currentPage = basename($_SERVER['PHP_SELF']);
-        if (!in_array($currentPage, ['welcome.php', 'login.php', 'index.php'])) {
-            // Redirigir a welcome si intenta acceder a otra página sin subdominio
-            header("Location: welcome.php");
-            exit;
+        // Si ya hay institución en sesión, usarla directamente (evita query extra)
+        if (!empty($_SESSION['id_institucion'])) {
+            self::$currentTenant = self::loadById($db, (int)$_SESSION['id_institucion']);
+            return self::$currentTenant;
         }
-        self::$currentTenant = null;
-        return null;
-    }
 
-    try {
-        $stmt = $db->prepare("SELECT * FROM tbl_institucion WHERE subdominio = :sub");
-        $stmt->execute([':sub' => $subdomain]);
-        $tenant = $stmt->fetch(PDO::FETCH_ASSOC);
+        $host  = explode(':', $_SERVER['HTTP_HOST'] ?? 'localhost')[0]; // remover puerto
+        $parts = explode('.', $host);
 
-        if (!$tenant) {
-            die("Error: Institución no encontrada para el subdominio '$subdomain'.");
+        // ── MODO LOCALHOST / SUBCARPETA ──────────────────────────────
+        // localhost, 127.0.0.1, o cualquier IP directa
+        if ($host === 'localhost' || $host === '127.0.0.1'
+            || filter_var($host, FILTER_VALIDATE_IP)) {
+            // Cargar la PRIMERA institución activa como tenant por defecto
+            // Esto permite usar el sistema sin subdominios en desarrollo
+            self::$currentTenant = self::loadDefault($db);
+            return self::$currentTenant;
         }
-        
-        self::$currentTenant = $tenant;
-    } catch (Exception $e) {
-        self::$currentTenant = null;
+
+        // ── MODO SUBDOMINIO (producción) ─────────────────────────────
+        // Requiere al menos 3 partes: sub.dominio.tld
+        if (count($parts) >= 3) {
+            $subdomain = strtolower($parts[0]);
+            // Ignorar www
+            if ($subdomain !== 'www') {
+                self::$currentTenant = self::loadBySubdomain($db, $subdomain);
+                return self::$currentTenant;
+            }
+        }
+
+        // Sin subdominio → cargar default
+        self::$currentTenant = self::loadDefault($db);
+        return self::$currentTenant;
     }
 
-    return self::$currentTenant;
-}
-    /**
-     * Retorna el ID de la institución actual
-     */
-    public static function getId() {
-        return self::$currentTenant['id'] ?? null;
+    private static function loadDefault(PDO $db): ?array {
+        try {
+            $stmt = $db->query(
+                "SELECT * FROM tbl_institucion WHERE estado = 'activo' ORDER BY id ASC LIMIT 1"
+            );
+            $tenant = $stmt->fetch(PDO::FETCH_ASSOC);
+            return $tenant ?: null;
+        } catch (PDOException $e) {
+            error_log('[TenantManager] loadDefault error: ' . $e->getMessage());
+            return null;
+        }
     }
-    
-    /**
-     * Retorna el nombre de la institución
-     */
-    public static function getName() {
+
+    private static function loadById(PDO $db, int $id): ?array {
+        try {
+            $stmt = $db->prepare(
+                "SELECT * FROM tbl_institucion WHERE id = :id AND estado = 'activo' LIMIT 1"
+            );
+            $stmt->execute([':id' => $id]);
+            return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        } catch (PDOException $e) {
+            error_log('[TenantManager] loadById error: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    private static function loadBySubdomain(PDO $db, string $sub): ?array {
+        try {
+            $stmt = $db->prepare(
+                "SELECT * FROM tbl_institucion WHERE subdominio = :sub AND estado = 'activo' LIMIT 1"
+            );
+            $stmt->execute([':sub' => $sub]);
+            $tenant = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$tenant) {
+                // Subdominio no encontrado → usar default
+                return self::loadDefault($db);
+            }
+            return $tenant;
+        } catch (PDOException $e) {
+            error_log('[TenantManager] loadBySubdomain error: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    public static function getId(): ?int {
+        return isset(self::$currentTenant['id']) ? (int)self::$currentTenant['id'] : null;
+    }
+
+    public static function getName(): string {
         return self::$currentTenant['nombre_ce'] ?? 'Educación Plus';
     }
+
+    public static function get(): ?array {
+        return self::$currentTenant;
+    }
+
+    public static function reset(): void {
+        self::$currentTenant = null;
+        self::$resolved      = false;
+    }
 }
-?>

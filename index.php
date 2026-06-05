@@ -1,26 +1,29 @@
 <?php
 session_start();
+require_once __DIR__ . '/config/app.php';
+
 if (!isset($_SESSION['user_id'])) {
-    header("Location: welcome.php");
-    exit;
+    redirect('/welcome.php');
 }
 
 $rol = $_SESSION['rol'];
 
-// Redirección según rol
 switch ($rol) {
-    case 'profesor':
-        include 'modules/profesor/profesor_dashboard.php';
-        break;
-    case 'estudiante':
-        include 'modules/estudiante/estudiante_dashboard.php';
+    case 'superadmin':
+        redirect('/superadmin/dashboard.php');
         break;
     case 'admin':
     case 'director':
-        include 'modules/dashboard/admin_dashboard.php';
+    case 'orientador':
+        redirect('/modules/dashboard/admin_dashboard.php');
+        break;
+    case 'profesor':
+        redirect('/modules/profesor/profesor_dashboard.php');
+        break;
+    case 'estudiante':
+        redirect('/modules/estudiante/estudiante_dashboard.php');
         break;
     default:
         session_destroy();
-        header("Location: login.php");
+        redirect('/login.php');
 }
-?>

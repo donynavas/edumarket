@@ -1,14 +1,14 @@
 <?php
 session_start();
-require '../config/database.php';
+require_once __DIR__ . '/../config/db_global.php';
 
 // Verificar Super Admin
 if (!isset($_SESSION['rol']) || $_SESSION['rol'] !== 'superadmin') {
-    header("Location: login.php");
+    header("Location: " . url('/superadmin/login.php'));
     exit;
 }
 
-$db = (new Database())->getConnection();
+$db = (new DatabaseGlobal())->getConnection();
 
 // Estadísticas Globales
 $total_instituciones = $db->query("SELECT COUNT(*) FROM tbl_institucion WHERE estado='activo'")->fetchColumn();

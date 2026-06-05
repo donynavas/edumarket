@@ -1,6 +1,6 @@
 <?php
 session_start();
-require '../../../config/database.php';
+require_once __DIR__ . '/../../../config/database.php';
 header('Content-Type: application/json');
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'profesor') {

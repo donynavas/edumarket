@@ -1,15 +1,15 @@
 <?php
-// ✅ session_start() DEBE estar activo
-//session_start();
+session_start();
+require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/app.php';
+
 
 // Verificar que sea profesor
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
-    header("Location: ../../login.php");
+    header("Location: " . BASE_URL . "/login.php");
     exit;
 }
 
-// ✅ Ruta CORRECTA desde modules/profesor/
-include 'config/database.php';
 
 $database = new Database();
 $db = $database->getConnection();

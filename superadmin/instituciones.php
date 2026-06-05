@@ -1,13 +1,13 @@
 <?php
 session_start();
-require '../config/database.php';
+require_once __DIR__ . '/../config/db_global.php';
 
 if (!isset($_SESSION['rol']) || $_SESSION['rol'] !== 'superadmin') {
-    header("Location: login.php");
+    header("Location: " . url('/superadmin/login.php'));
     exit;
 }
 
-$db = (new Database())->getConnection();
+$db = (new DatabaseGlobal())->getConnection();
 $mensaje = '';
 
 // Procesar Crear Institución

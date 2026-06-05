@@ -1,47 +1,53 @@
 <?php
-// config/database.php
+// config/database.php — Conexión PDO segura con soporte multitenant
 
-// ✅ FIX: Use __DIR__ to point to the current directory (config/)
+require_once __DIR__ . '/app.php';
 require_once __DIR__ . '/TenantManager.php';
 
 class Database {
-    private $host = "127.0.0.1";
-    private $db_name = "educacion_plus";
-    private $username = "root";
-    private $password = "";
-    public $conn;
+    private string $host;
+    private string $db_name;
+    private string $username;
+    private string $password;
+    public ?PDO $conn = null;
 
-    public function getConnection() {
-        $this->conn = null;
+    public function __construct() {
+        $this->host     = defined('DB_HOST') ? DB_HOST : '127.0.0.1';
+        $this->db_name  = defined('DB_NAME') ? DB_NAME : 'educacion_plus';
+        $this->username = defined('DB_USER') ? DB_USER : 'root';
+        $this->password = defined('DB_PASS') ? DB_PASS : '';
+    }
+
+    public function getConnection(): ?PDO {
+        if ($this->conn !== null) return $this->conn;
+
+        $dsn = "mysql:host={$this->host};dbname={$this->db_name};charset=utf8mb4";
         try {
-            // Create connection
-            $this->conn = new PDO("mysql:host=" . $this->host . ";dbname=" . $this->db_name, $this->username, $this->password);
-            
-            // Set attributes
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-            $this->conn->exec("set names utf8mb4");
-            
-            // ✅ Initialize Multi-Tenant Manager automatically
+            $this->conn = new PDO($dsn, $this->username, $this->password, [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES   => false,
+                PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
+            ]);
+
+            // Resolver tenant automáticamente
             TenantManager::resolve($this->conn);
-            
-        } catch(PDOException $e) {
-            echo "Connection Error: " . $e->getMessage();
+
+        } catch (PDOException $e) {
+            error_log('[Database] Conexión fallida: ' . $e->getMessage());
+            // No mostrar detalles al usuario
+            die('Error de conexión a la base de datos. Verifique la configuración en config/app.php');
         }
         return $this->conn;
     }
-    
-    // ✅ Helper method to apply tenant filter
-    public function tenantQuery($sql) {
+
+    // Compatibilidad con código que usa tenantQuery()
+    public function tenantQuery(string $sql): string {
         $tenantId = TenantManager::getId();
-        if (!$tenantId) return $sql; // Fallback if not multi-tenant
-        
-        // Add filter based on table structure
+        if (!$tenantId) return $sql;
         if (stripos($sql, 'WHERE') !== false) {
-            return $sql . " AND id_institucion = $tenantId";
-        } else {
-            return $sql . " WHERE id_institucion = $tenantId";
+            return $sql . " AND id_institucion = " . (int)$tenantId;
         }
+        return $sql . " WHERE id_institucion = " . (int)$tenantId;
     }
 }
-?>

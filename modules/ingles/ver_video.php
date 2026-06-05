@@ -1,6 +1,6 @@
 <?php
 session_start();
-include '../../config/database.php';
+require_once __DIR__ . '/../../config/database.php';
 include 'functions/video_functions.php';
 
 $id_video = $_GET['id'] ?? 0;

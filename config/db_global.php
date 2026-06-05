@@ -1,24 +1,27 @@
 <?php
-// config/db_global.php - Conexión sin multi-tenant
+// config/db_global.php — Conexión global (sin tenant) para superadmin
+require_once __DIR__ . '/app.php';
+require_once __DIR__ . '/database.php';
 
+// Alias para compatibilidad con superadmin
 class DatabaseGlobal {
-    private $host = "127.0.0.1";
-    private $db_name = "educacion_plus";
-    private $username = "root";
-    private $password = "";
-    public $conn;
+    private static ?PDO $conn = null;
 
-    public function getConnection() {
-        $this->conn = null;
+    public function getConnection(): PDO {
+        if (self::$conn !== null) return self::$conn;
+        
+        $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
         try {
-            $this->conn = new PDO("mysql:host=" . $this->host . ";dbname=" . $this->db_name, $this->username, $this->password);
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-            $this->conn->exec("set names utf8mb4");
-        } catch(PDOException $e) {
-            echo "Connection Error: " . $e->getMessage();
+            self::$conn = new PDO($dsn, DB_USER, DB_PASS, [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES   => false,
+                PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4",
+            ]);
+        } catch (PDOException $e) {
+            error_log('[DatabaseGlobal] ' . $e->getMessage());
+            die('Error de conexión. Verifique la configuración en config/app.php');
         }
-        return $this->conn;
+        return self::$conn;
     }
 }
-?>

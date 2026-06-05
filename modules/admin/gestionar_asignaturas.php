@@ -1,10 +1,10 @@
 <?php
 session_start();
-require '../../config/database.php';
+require_once __DIR__ . '/../../config/database.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'director'])) {
-    header("Location: ../../login.php");
+    header("Location: " . BASE_URL . "/login.php");
     exit;
 }
 

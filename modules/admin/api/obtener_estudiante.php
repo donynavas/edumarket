@@ -1,6 +1,6 @@
 <?php
 session_start();
-include '../../../config/database.php';
+require_once __DIR__ . '/../../../config/database.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['rol'] != 'director')) {
