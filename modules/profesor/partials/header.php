@@ -56,6 +56,16 @@ $idAsignacionFiltro = $idAsignacionFiltro ?? null;
 $unreadMensajes = 0;
 if (isset($db) && $db instanceof PDO && !empty($user_id)) {
     require_once __DIR__ . '/../../../config/MensajeHelper.php';
+
+    // Barrido de recordatorios de fecha_limite próxima (no hay cron real en
+    // este entorno -- se revisa en cada carga de página de profesor). Es
+    // idempotente vía tbl_actividad.recordatorio_enviado, así que corre
+    // ANTES de leer el contador de no leídos para que un recordatorio recién
+    // generado en esta misma carga ya se refleje en el badge de abajo.
+    require_once __DIR__ . '/../../../config/TenantGuard.php';
+    require_once __DIR__ . '/../../../config/RecordatorioHelper.php';
+    RecordatorioHelper::procesarRecordatoriosPendientes($db, TenantGuard::id());
+
     $unreadMensajes = MensajeHelper::contarNoLeidos($db, (int) $user_id);
 }
 

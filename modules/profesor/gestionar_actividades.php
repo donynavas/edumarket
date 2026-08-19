@@ -169,13 +169,89 @@ function resolverVinculoCuadroNotas(PDO $db, int $tid, int $idAsignacion, int $a
     return ['id_periodo' => $idPeriodoPost, 'bloque_notas' => $casilla['bloque'], 'numero_nota' => $casilla['numero_nota']];
 }
 
+/**
+ * Crea UNA actividad (con su vínculo opcional al Cuadro de Notas y su
+ * examen real + preguntas si tipo='examen') en la asignación docente
+ * $idAsignacion. Extraído del cuerpo de la rama "crear" para poder
+ * llamarse una vez por sección cuando el profesor elige "Publicar a: Todo
+ * el grado" (ver búsqueda de secciones hermanas en la rama "crear" más
+ * abajo) sin duplicar la lógica de examen/Cuadro de Notas. $preguntas ya
+ * viene decodificado (mismo arreglo se reutiliza para todas las secciones
+ * cuando hay fan-out por grado -- "misma info" en cada copia).
+ */
+function crearActividadEnAsignacion(
+    PDO $db, int $tid, int $idAsignacion, int $anno, string $nivel,
+    string $titulo, string $descripcion, string $tipo,
+    string $fecha_programada, ?string $fecha_limite, ?int $duracion_minutos,
+    float $nota_maxima, string $contenido, ?string $url_recurso, string $recursos_url,
+    string $estado, ?int $id_periodo_post, ?string $casilla_post, ?array $preguntas
+): int {
+    $vinculo = ['id_periodo' => null, 'bloque_notas' => null, 'numero_nota' => null];
+    if (in_array($tipo, ['tarea', 'examen'], true)) {
+        $vinculo = resolverVinculoCuadroNotas($db, $tid, $idAsignacion, $anno, $nivel, $id_periodo_post, $casilla_post, null);
+    }
+
+    $id_examen = null;
+    if ($tipo === 'examen') {
+        $stmtExamen = $db->prepare("INSERT INTO tbl_examen
+            (id_asignacion_docente, titulo, descripcion, duracion_minutos, nota_maxima,
+             fecha_programada, fecha_limite, estado)
+            VALUES (:asig, :titulo, :descripcion, :duracion, :nota_maxima, :fecha_prog, :fecha_limite, :estado)");
+        $stmtExamen->execute([
+            ':asig' => $idAsignacion, ':titulo' => $titulo, ':descripcion' => $descripcion,
+            ':duracion' => $duracion_minutos, ':nota_maxima' => $nota_maxima,
+            ':fecha_prog' => $fecha_programada, ':fecha_limite' => $fecha_limite,
+            ':estado' => mapEstadoActividadAExamen($estado)
+        ]);
+        $id_examen = (int) $db->lastInsertId();
+        guardarPreguntasExamen($db, $id_examen, $preguntas);
+    }
+
+    // tbl_actividad no tiene columna id_institucion. duracion_minutos es
+    // TIME en el esquema real (no INT); se convierte con SEC_TO_TIME desde
+    // los minutos del formulario.
+    $stmt = $db->prepare("INSERT INTO tbl_actividad (id_asignacion_docente, id_examen, id_periodo, bloque_notas, numero_nota,
+              titulo, descripcion, tipo,
+              fecha_programada, fecha_limite, duracion_minutos, nota_maxima,
+              contenido, url_recurso, recursos_url, estado)
+              VALUES (:id_asignacion, :id_examen, :id_periodo, :bloque_notas, :numero_nota,
+                      :titulo, :descripcion, :tipo,
+                      :fecha_programada, :fecha_limite, SEC_TO_TIME(:duracion * 60), :nota_maxima,
+                      :contenido, :url_recurso, :recursos, :estado)");
+    $stmt->execute([
+        ':id_asignacion' => $idAsignacion,
+        ':id_examen' => $id_examen,
+        ':id_periodo' => $vinculo['id_periodo'],
+        ':bloque_notas' => $vinculo['bloque_notas'],
+        ':numero_nota' => $vinculo['numero_nota'],
+        ':titulo' => $titulo,
+        ':descripcion' => $descripcion,
+        ':tipo' => $tipo,
+        ':fecha_programada' => $fecha_programada,
+        ':fecha_limite' => $fecha_limite,
+        ':duracion' => $duracion_minutos,
+        ':nota_maxima' => $nota_maxima,
+        ':contenido' => $contenido,
+        ':url_recurso' => $url_recurso,
+        ':recursos' => $recursos_url,
+        ':estado' => $estado
+    ]);
+
+    return (int) $db->lastInsertId();
+}
+
 // ===== PROCESAR ACCIONES POST =====
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $accion = $_POST['accion'] ?? '';
     
     try {
-        $db->beginTransaction();
-        
+        // Nota: cada rama abre su propia transacción (en vez de una sola
+        // que envuelva las tres) porque "crear" ahora puede insertar N
+        // actividades independientes -- una por sección del grado, ver
+        // "Publicar a: Todo el grado" más abajo -- y cada una debe poder
+        // fallar sin deshacer las demás. Mismo patrón "una transacción por
+        // fila" que modules/admin/api/importar_estudiantes.php.
+
         // === CREAR ACTIVIDAD ===
         if ($accion == 'crear') {
             $id_asignacion = filter_input(INPUT_POST, 'id_asignacion', FILTER_VALIDATE_INT);
@@ -195,11 +271,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $casilla_post = trim($_POST['casilla'] ?? '') ?: null;
 
             // Verificar que la asignación pertenece al profesor. Se trae
-            // también anno + nivel del grado (vía sección) para poder
-            // validar la vinculación al Cuadro de Notas más abajo.
+            // también anno + nivel + id_grado/id_asignatura (vía
+            // sección/asignatura) para poder validar la vinculación al
+            // Cuadro de Notas más abajo y, si el profesor eligió "Publicar
+            // a: Todo el grado", para buscar las secciones hermanas.
             // tbl_asignacion_docente no tiene columna id_institucion;
             // id_profesor ya está tenant-verificado.
-            $check = $db->prepare("SELECT ad.id, ad.anno, g.nivel FROM tbl_asignacion_docente ad
+            $check = $db->prepare("SELECT ad.id, ad.anno, g.nivel, g.id AS id_grado, asig.id AS id_asignatura
+                                   FROM tbl_asignacion_docente ad
+                                   JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
                                    JOIN tbl_seccion s ON ad.id_seccion = s.id
                                    JOIN tbl_grado g ON s.id_grado = g.id
                                    WHERE ad.id = :id AND ad.id_profesor = :prof");
@@ -207,74 +287,84 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $asignacionInfo = $check->fetch(PDO::FETCH_ASSOC);
 
             if ($asignacionInfo && !empty($titulo)) {
-                $id_examen = null;
-
-                $vinculo = ['id_periodo' => null, 'bloque_notas' => null, 'numero_nota' => null];
-                if (in_array($tipo, ['tarea', 'examen'], true)) {
-                    $vinculo = resolverVinculoCuadroNotas($db, $tid, $id_asignacion, (int) $asignacionInfo['anno'], $asignacionInfo['nivel'], $id_periodo_post, $casilla_post, null);
-                }
-
-                // Si el tipo es "examen", se crea un examen REAL (mismas
-                // tablas que usa el motor autocalificable) y se enlaza a
-                // esta actividad — ver helpers arriba.
+                // Si el tipo es "examen", se valida UNA sola vez (antes del
+                // loop de abajo) que haya preguntas -- evita repetir el
+                // mismo error N veces si "Publicar a: Todo el grado" está
+                // activo. El mismo arreglo de preguntas se reutiliza para
+                // cada copia de la actividad (examen real independiente por
+                // sección, mismas preguntas).
+                $preguntas = null;
                 if ($tipo === 'examen') {
                     $preguntas = json_decode($_POST['preguntas_json'] ?? '[]', true);
                     if (!is_array($preguntas) || empty($preguntas)) {
                         throw new Exception('Un examen necesita al menos una pregunta');
                     }
-                    $stmtExamen = $db->prepare("INSERT INTO tbl_examen
-                        (id_asignacion_docente, titulo, descripcion, duracion_minutos, nota_maxima,
-                         fecha_programada, fecha_limite, estado)
-                        VALUES (:asig, :titulo, :descripcion, :duracion, :nota_maxima, :fecha_prog, :fecha_limite, :estado)");
-                    $stmtExamen->execute([
-                        ':asig' => $id_asignacion, ':titulo' => $titulo, ':descripcion' => $descripcion,
-                        ':duracion' => $duracion_minutos, ':nota_maxima' => $nota_maxima,
-                        ':fecha_prog' => $fecha_programada, ':fecha_limite' => $fecha_limite,
-                        ':estado' => mapEstadoActividadAExamen($estado)
-                    ]);
-                    $id_examen = (int) $db->lastInsertId();
-                    guardarPreguntasExamen($db, $id_examen, $preguntas);
                 }
 
-                // tbl_actividad tampoco tiene columna id_institucion.
-                // duracion_minutos es TIME en el esquema real (no INT); se
-                // convierte con SEC_TO_TIME desde los minutos del formulario.
-                $query = "INSERT INTO tbl_actividad (id_asignacion_docente, id_examen, id_periodo, bloque_notas, numero_nota,
-                          titulo, descripcion, tipo,
-                          fecha_programada, fecha_limite, duracion_minutos, nota_maxima,
-                          contenido, url_recurso, recursos_url, estado)
-                          VALUES (:id_asignacion, :id_examen, :id_periodo, :bloque_notas, :numero_nota,
-                                  :titulo, :descripcion, :tipo,
-                                  :fecha_programada, :fecha_limite, SEC_TO_TIME(:duracion * 60), :nota_maxima,
-                                  :contenido, :url_recurso, :recursos, :estado)";
-                $stmt = $db->prepare($query);
-                $stmt->execute([
-                    ':id_asignacion' => $id_asignacion,
-                    ':id_examen' => $id_examen,
-                    ':id_periodo' => $vinculo['id_periodo'],
-                    ':bloque_notas' => $vinculo['bloque_notas'],
-                    ':numero_nota' => $vinculo['numero_nota'],
-                    ':titulo' => $titulo,
-                    ':descripcion' => $descripcion,
-                    ':tipo' => $tipo,
-                    ':fecha_programada' => $fecha_programada,
-                    ':fecha_limite' => $fecha_limite,
-                    ':duracion' => $duracion_minutos,
-                    ':nota_maxima' => $nota_maxima,
-                    ':contenido' => $contenido,
-                    ':url_recurso' => $url_recurso,
-                    ':recursos' => $recursos_url,
-                    ':estado' => $estado
-                ]);
+                // "Publicar a": 'seccion' (por defecto, comportamiento de
+                // siempre) o 'grado' -- crea una copia independiente de la
+                // actividad en cada sección del mismo grado donde este
+                // profesor tenga una asignación docente ACTIVA para la
+                // MISMA asignatura. La asignación actual siempre se incluye
+                // sin importar su propio estado (igual que hoy).
+                $publicarA = ($_POST['publicar_a'] ?? 'seccion') === 'grado' ? 'grado' : 'seccion';
+                $targets = [['id' => $id_asignacion, 'anno' => (int) $asignacionInfo['anno'], 'nivel' => $asignacionInfo['nivel']]];
 
-                $db->commit();
-                $mensaje = 'Actividad creada exitosamente';
-                $tipo_mensaje = 'success';
+                if ($publicarA === 'grado') {
+                    $stmtSib = $db->prepare("SELECT ad2.id, ad2.anno, g.nivel FROM tbl_asignacion_docente ad2
+                                              JOIN tbl_seccion s2 ON ad2.id_seccion = s2.id
+                                              JOIN tbl_grado g ON s2.id_grado = g.id
+                                              WHERE ad2.id_profesor = :prof AND ad2.id_asignatura = :asig
+                                              AND g.id = :id_grado AND ad2.anno = :anno AND ad2.estado = 1
+                                              AND ad2.id != :id_actual");
+                    $stmtSib->execute([
+                        ':prof' => $id_profesor,
+                        ':asig' => $asignacionInfo['id_asignatura'],
+                        ':id_grado' => $asignacionInfo['id_grado'],
+                        ':anno' => $asignacionInfo['anno'],
+                        ':id_actual' => $id_asignacion,
+                    ]);
+                    foreach ($stmtSib->fetchAll(PDO::FETCH_ASSOC) as $sib) {
+                        $targets[] = ['id' => (int) $sib['id'], 'anno' => (int) $sib['anno'], 'nivel' => $sib['nivel']];
+                    }
+                }
+
+                $creadas = 0;
+                $errores = [];
+                foreach ($targets as $t) {
+                    try {
+                        $db->beginTransaction();
+                        crearActividadEnAsignacion(
+                            $db, $tid, (int) $t['id'], (int) $t['anno'], $t['nivel'],
+                            $titulo, $descripcion, $tipo, $fecha_programada, $fecha_limite, $duracion_minutos,
+                            $nota_maxima, $contenido, $url_recurso, $recursos_url, $estado,
+                            $id_periodo_post, $casilla_post, $preguntas
+                        );
+                        $db->commit();
+                        $creadas++;
+                    } catch (Exception $e) {
+                        if ($db->inTransaction()) {
+                            $db->rollBack();
+                        }
+                        $errores[] = "Asignación #{$t['id']}: " . $e->getMessage();
+                    }
+                }
+
+                if ($creadas === 0) {
+                    throw new Exception('No se pudo crear la actividad. ' . implode(' | ', $errores));
+                }
+
+                $mensaje = $creadas > 1 ? "Actividad creada en $creadas secciones." : 'Actividad creada exitosamente';
+                if ($errores) {
+                    $mensaje .= ' (Con errores en algunas secciones: ' . implode(' | ', $errores) . ')';
+                }
+                $tipo_mensaje = $errores ? 'warning' : 'success';
             } else {
                 throw new Exception("Datos inválidos o no tiene permiso para esta asignación");
             }
-            
+
         } elseif ($accion == 'actualizar') {
+            $db->beginTransaction();
             $id_actividad = filter_input(INPUT_POST, 'id_actividad', FILTER_VALIDATE_INT);
             $id_asignacion = filter_input(INPUT_POST, 'id_asignacion', FILTER_VALIDATE_INT);
             $titulo = trim($_POST['titulo'] ?? '');
@@ -399,8 +489,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
             
         } elseif ($accion == 'eliminar') {
+            $db->beginTransaction();
             $id_actividad = filter_input(INPUT_POST, 'id_actividad', FILTER_VALIDATE_INT);
-            
+
             // Verificar propiedad y eliminar en cascada. Ni tbl_actividad ni
             // tbl_entrega_actividad tienen columna id_institucion.
             $check = $db->prepare("SELECT a.id FROM tbl_actividad a
@@ -426,7 +517,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         }
         
     } catch (Exception $e) {
-        $db->rollBack();
+        // Tras el refactor de "crear" (una transacción por sección, ver
+        // arriba) puede llegar una excepción sin ninguna transacción
+        // abierta -- p.ej. la validación "no tiene permiso para esta
+        // asignación", que se lanza antes de entrar al loop.
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
         error_log("Error en gestionar_actividades.php: " . $e->getMessage());
         $mensaje = 'Error: ' . $e->getMessage();
         $tipo_mensaje = 'danger';
@@ -596,6 +693,43 @@ $tipos_actividad = [
     'enlace' => ['label' => '🔗 Enlace', 'icon' => 'fa-link', 'color' => 'secondary']
 ];
 
+// ===== EVENTOS PARA EL MODAL "CALENDARIO" =====
+// A diferencia de $actividades (arriba), que solo trae la asignación
+// actualmente filtrada, este barrido trae TODAS las asignaciones del
+// profesor -- el calendario es una vista de planificación general, no
+// depende del filtro de la lista. Se ubica después de $tipos_actividad
+// (arriba) porque necesita su mapa de colores por tipo.
+$stmt_cal = $db->prepare("SELECT a.id, a.titulo, a.tipo, a.estado, a.fecha_programada, a.fecha_limite,
+             asig.nombre AS asignatura_nombre, g.nombre AS grado_nombre, s.nombre AS seccion_nombre
+             FROM tbl_actividad a
+             JOIN tbl_asignacion_docente ad ON a.id_asignacion_docente = ad.id
+             JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
+             JOIN tbl_seccion s ON ad.id_seccion = s.id
+             JOIN tbl_grado g ON s.id_grado = g.id
+             WHERE ad.id_profesor = :id_profesor AND asig.id_institucion = :tid AND a.estado != 'eliminado'
+             ORDER BY a.fecha_programada");
+$stmt_cal->execute([':id_profesor' => $id_profesor, ':tid' => $tid]);
+$actividades_todas = $stmt_cal->fetchAll(PDO::FETCH_ASSOC);
+
+$hex_por_color = ['warning' => '#f39c12', 'danger' => '#e74c3c', 'info' => '#17a2b8', 'primary' => '#3498db',
+                   'purple' => '#9b59b6', 'success' => '#2ecc71', 'teal' => '#20c997', 'secondary' => '#95a5a6'];
+// Se grafica por fecha_programada (no fecha_limite) para que coincida con
+// lo que el clic en una fecha del calendario va a rellenar en el
+// formulario de creación (ver dateClick más abajo).
+$eventos_calendar_todas = array_map(function ($a) use ($tipos_actividad, $hex_por_color) {
+    $t = $tipos_actividad[$a['tipo']] ?? ['color' => 'secondary'];
+    return [
+        'title' => $a['titulo'],
+        'start' => $a['fecha_programada'],
+        'color' => $hex_por_color[$t['color']] ?? '#3498db',
+        'extendedProps' => [
+            'tipo' => $a['tipo'], 'asignatura' => $a['asignatura_nombre'],
+            'grado' => $a['grado_nombre'], 'seccion' => $a['seccion_nombre'],
+            'fecha_limite' => $a['fecha_limite'],
+        ],
+    ];
+}, $actividades_todas);
+
 $estados_actividad = [
     'programado' => ['label' => 'Programado', 'class' => 'bg-secondary'],
     'publicado' => ['label' => 'Publicado', 'class' => 'bg-success'],
@@ -607,6 +741,7 @@ $activePage = 'actividades';
 $pageTitle = 'Gestionar Actividades - Educación Plus';
 ob_start();
 ?>
+<link href="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.css" rel="stylesheet">
 <style>
     .card-custom { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); border: none; margin-bottom: 20px; }
     .activity-card { border-left: 4px solid var(--secondary); transition: all 0.2s; }
@@ -637,9 +772,14 @@ require __DIR__ . '/partials/header.php';
                 <h2><i class="fas fa-tasks"></i> Gestionar Actividades</h2>
                 <p class="text-muted mb-0">Crear, editar y organizar actividades para tus clases</p>
             </div>
-            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalActividad" onclick="prepararModalCrear()">
-                <i class="fas fa-plus"></i> Nueva Actividad
-            </button>
+            <div>
+                <button class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#modalCalendario">
+                    <i class="fas fa-calendar-alt"></i> Calendario
+                </button>
+                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalActividad" onclick="prepararModalCrear()">
+                    <i class="fas fa-plus"></i> Nueva Actividad
+                </button>
+            </div>
         </div>
 
         <!-- Messages -->
@@ -781,6 +921,14 @@ require __DIR__ . '/partials/header.php';
                         <input type="hidden" name="preguntas_json" id="preguntas_json">
 
                         <div class="row g-3">
+                            <div class="col-12 d-none" id="bloque_publicar_a">
+                                <label class="form-label">Publicar a</label>
+                                <select name="publicar_a" id="publicar_a" class="form-select">
+                                    <option value="seccion" selected>Solo esta sección</option>
+                                    <option value="grado">Todo el grado (todas mis secciones donde imparto esta materia)</option>
+                                </select>
+                                <small class="text-muted">Crea una copia independiente de esta actividad (con su propio examen, si aplica) en cada sección.</small>
+                            </div>
                             <div class="col-md-8">
                                 <label class="form-label">Título *</label>
                                 <input type="text" name="titulo" id="titulo" class="form-control" required placeholder="Título de la actividad">
@@ -900,8 +1048,26 @@ require __DIR__ . '/partials/header.php';
         </div>
     </div>
 
+    <!-- Modal Calendario -->
+    <div class="modal fade" id="modalCalendario" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-calendar-alt"></i> Calendario de Actividades</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small mb-2">Todas tus actividades, en todas tus asignaciones. Haz clic en una fecha para crear una actividad nueva ese día.</p>
+                    <div id="calendarActividades"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Scripts -->
     <?php require __DIR__ . '/partials/scripts.php'; ?>
+    <script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/main.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fullcalendar@5.11.3/locales/es.js"></script>
 
     <script>
         function prepararModalCrear() {
@@ -910,6 +1076,10 @@ require __DIR__ . '/partials/header.php';
             document.getElementById('modalTitle').innerHTML = '<i class="fas fa-plus"></i> Nueva Actividad';
             document.getElementById('formActividad').reset();
             document.getElementById('fecha_programada').value = new Date().toISOString().slice(0,16);
+            // "Publicar a" solo tiene sentido al crear (accion='actualizar'
+            // siempre edita UNA actividad puntual) -- form.reset() ya deja
+            // #publicar_a en su valor 'seccion' por defecto.
+            document.getElementById('bloque_publicar_a').classList.remove('d-none');
             vaciarPreguntasExamen();
             mostrarCamposTipo();
         }
@@ -930,6 +1100,10 @@ require __DIR__ . '/partials/header.php';
             document.getElementById('accion').value = 'actualizar';
             document.getElementById('id_actividad').value = act.id;
             document.getElementById('modalTitle').innerHTML = '<i class="fas fa-edit"></i> Editar Actividad';
+            // "Publicar a" no aplica al editar (siempre es UNA actividad
+            // puntual); se oculta -- el servidor ignora publicar_a cuando
+            // accion='actualizar' de todas formas.
+            document.getElementById('bloque_publicar_a').classList.add('d-none');
             document.getElementById('titulo').value = act.titulo;
             document.getElementById('tipo').value = act.tipo;
             document.getElementById('descripcion').value = act.descripcion || '';
@@ -1263,6 +1437,42 @@ require __DIR__ . '/partials/header.php';
         document.addEventListener('DOMContentLoaded', function() {
             if (window.innerWidth < 992) $('#sidebar').addClass('active');
             mostrarCamposTipo();
+        });
+
+        // ===== Modal "Calendario" =====
+        // Se inicializa recién cuando el modal termina de mostrarse
+        // (shown.bs.modal), no en DOMContentLoaded: FullCalendar renderiza
+        // con ancho cero si se inicializa dentro de un modal de Bootstrap
+        // que todavía está oculto (display:none).
+        const eventosCalendarTodas = <?= json_encode($eventos_calendar_todas, JSON_UNESCAPED_UNICODE) ?>;
+        let calendarActividadesInstancia = null;
+
+        document.getElementById('modalCalendario').addEventListener('shown.bs.modal', function() {
+            if (!calendarActividadesInstancia) {
+                calendarActividadesInstancia = new FullCalendar.Calendar(document.getElementById('calendarActividades'), {
+                    initialView: 'dayGridMonth',
+                    locale: 'es',
+                    height: 'auto',
+                    events: eventosCalendarTodas,
+                    eventDidMount: function(info) {
+                        const p = info.event.extendedProps;
+                        info.el.title = info.event.title + ' — ' + p.asignatura + ' (' + p.grado + ' ' + p.seccion + ')';
+                    },
+                    dateClick: function(info) {
+                        const modalCalEl = document.getElementById('modalCalendario');
+                        modalCalEl.addEventListener('hidden.bs.modal', function onHidden() {
+                            prepararModalCrear();
+                            document.getElementById('fecha_programada').value = info.dateStr + 'T08:00';
+                            new bootstrap.Modal(document.getElementById('modalActividad')).show();
+                            modalCalEl.removeEventListener('hidden.bs.modal', onHidden);
+                        }, { once: true });
+                        bootstrap.Modal.getInstance(modalCalEl).hide();
+                    },
+                });
+                calendarActividadesInstancia.render();
+            } else {
+                calendarActividadesInstancia.updateSize();
+            }
         });
     </script>
 </body>

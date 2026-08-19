@@ -17,6 +17,16 @@ $user_id = $_SESSION['user_id'];
 $tid = TenantGuard::id();
 
 require_once __DIR__ . '/../../config/MensajeHelper.php';
+
+// Barrido de recordatorios de fecha_limite próxima (no hay cron real en
+// este entorno -- se revisa cuando el estudiante entra al sistema, en su
+// página de aterrizaje tras el login). Idempotente vía
+// tbl_actividad.recordatorio_enviado -- corre ANTES de contar los no
+// leídos para que un recordatorio recién generado en esta misma carga ya
+// se refleje en el badge.
+require_once __DIR__ . '/../../config/RecordatorioHelper.php';
+RecordatorioHelper::procesarRecordatoriosPendientes($db, $tid);
+
 $totalNoLeidos = MensajeHelper::contarNoLeidos($db, (int) $user_id);
 
 // ===== OBTENER DATOS DEL ESTUDIANTE =====
