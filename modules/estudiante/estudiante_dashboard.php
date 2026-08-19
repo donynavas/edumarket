@@ -16,6 +16,9 @@ $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 $tid = TenantGuard::id();
 
+require_once __DIR__ . '/../../config/MensajeHelper.php';
+$totalNoLeidos = MensajeHelper::contarNoLeidos($db, (int) $user_id);
+
 // ===== OBTENER DATOS DEL ESTUDIANTE =====
 $query = "SELECT
           e.id as id_estudiante, e.nie, e.estado_familiar, e.discapacidad, e.trabaja,
@@ -302,6 +305,10 @@ $nombre_completo = trim("{$estudiante['primer_nombre']} {$estudiante['segundo_no
             <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/mis_clases.php"><i class="fas fa-book"></i> Mis Clases</a>
             <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/actividades.php"><i class="fas fa-tasks"></i> Actividades</a>
             <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/mis_notas.php"><i class="fas fa-star"></i> Calificaciones</a>
+            <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/mensajes.php">
+                <i class="fas fa-envelope"></i> Mensajes
+                <?php if ($totalNoLeidos > 0): ?><span class="badge bg-danger rounded-pill float-end"><?= $totalNoLeidos ?></span><?php endif; ?>
+            </a>
             <a class="nav-link" href="<?= BASE_URL ?>/logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </aside>

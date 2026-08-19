@@ -49,6 +49,16 @@ $mostrarAsignacionesSidebar = $mostrarAsignacionesSidebar ?? false;
 $asignaciones = $asignaciones ?? [];
 $idAsignacionFiltro = $idAsignacionFiltro ?? null;
 
+// Badge de mensajes no leídos -- $db y $user_id ya están disponibles en
+// este punto porque toda página del módulo los define antes de requerir
+// este parcial (ver database.php/TenantGuard::id() al inicio de cada
+// archivo). Defensivo por si algún caller nuevo no los define todavía.
+$unreadMensajes = 0;
+if (isset($db) && $db instanceof PDO && !empty($user_id)) {
+    require_once __DIR__ . '/../../../config/MensajeHelper.php';
+    $unreadMensajes = MensajeHelper::contarNoLeidos($db, (int) $user_id);
+}
+
 // Set único de enlaces del sidebar. Antes 9 páginas tenían 9 subconjuntos
 // distintos de estos mismos enlaces (algunos con "Estudiantes" apuntando
 // al archivo equivocado) -- ahora todas comparten exactamente esta lista.
@@ -57,6 +67,7 @@ $NAV_LINKS = [
     'actividades'  => ['href' => 'gestionar_actividades.php', 'icon' => 'fa-tasks',          'label' => 'Actividades'],
     'calificaciones' => ['href' => 'calificaciones.php',      'icon' => 'fa-star',           'label' => 'Calificaciones'],
     'estudiantes'  => ['href' => 'gestionar_estudiantes.php', 'icon' => 'fa-user-graduate',  'label' => 'Estudiantes'],
+    'mensajes'     => ['href' => 'mensajes.php',               'icon' => 'fa-envelope',       'label' => 'Mensajes', 'badge' => $unreadMensajes ?: null],
     'examen'       => ['href' => 'asignar_examen.php',        'icon' => 'fa-file-alt',       'label' => 'Asignar Examen'],
     'banco'        => ['href' => 'banco_preguntas.php',       'icon' => 'fa-layer-group',    'label' => 'Banco de Preguntas'],
     'tablon'       => ['href' => 'tablon.php',                'icon' => 'fa-th-large',       'label' => 'Tablón'],
@@ -113,6 +124,9 @@ $NAV_LINKS = [
             <?php foreach ($NAV_LINKS as $key => $link): ?>
             <a class="nav-link<?= $activePage === $key ? ' active' : '' ?>" href="<?= htmlspecialchars($link['href']) ?>">
                 <i class="fas <?= htmlspecialchars($link['icon']) ?>"></i> <?= htmlspecialchars($link['label']) ?>
+                <?php if (!empty($link['badge'])): ?>
+                <span class="badge bg-danger rounded-pill float-end"><?= (int) $link['badge'] ?></span>
+                <?php endif; ?>
             </a>
             <?php endforeach; ?>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>

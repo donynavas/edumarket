@@ -14,6 +14,9 @@ $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 $tid = TenantGuard::id();
 
+require_once __DIR__ . '/../../config/MensajeHelper.php';
+$totalNoLeidos = MensajeHelper::contarNoLeidos($db, (int) $user_id);
+
 // Obtener ID de la asignatura desde la URL
 $id_asignacion = filter_input(INPUT_GET, 'id_asignacion', FILTER_VALIDATE_INT);
 if (!$id_asignacion) {
@@ -228,6 +231,10 @@ $tipos_actividad = [
             <a class="nav-link" href="mis_clases.php"><i class="fas fa-book"></i> Mis Clases</a>
             <a class="nav-link" href="actividades.php"><i class="fas fa-tasks"></i> Actividades</a>
             <a class="nav-link" href="mis_notas.php"><i class="fas fa-star"></i> Calificaciones</a>
+            <a class="nav-link" href="mensajes.php">
+                <i class="fas fa-envelope"></i> Mensajes
+                <?php if ($totalNoLeidos > 0): ?><span class="badge bg-danger rounded-pill float-end"><?= $totalNoLeidos ?></span><?php endif; ?>
+            </a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </aside>
