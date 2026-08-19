@@ -8,6 +8,8 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['r
     exit;
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
@@ -18,72 +20,89 @@ $tipo_mensaje = '';
 // Procesar acciones POST
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $accion = $_POST['accion'] ?? '';
-    
+
     try {
         $db->beginTransaction();
-        
+
         // CREAR NUEVA MATRÍCULA
         if ($accion == 'crear') {
+            // Verificar que el estudiante y la sección sean de esta institución
+            TenantGuard::assertOwner($db, 'tbl_estudiante', (int)$_POST['id_estudiante']);
+            TenantGuard::assertOwner($db, 'tbl_seccion', (int)$_POST['id_seccion']);
+
             // Verificar si ya existe matrícula activa
-            $checkQuery = "SELECT COUNT(*) as total FROM tbl_matricula 
-                          WHERE id_estudiante = :id_estudiante 
-                          AND anno = :anno 
+            $checkQuery = "SELECT COUNT(*) as total FROM tbl_matricula
+                          WHERE id_estudiante = :id_estudiante
+                          AND anno = :anno
                           AND estado = 'activo'";
             $checkStmt = $db->prepare($checkQuery);
             $checkStmt->bindValue(':id_estudiante', $_POST['id_estudiante'], PDO::PARAM_INT);
             $checkStmt->bindValue(':anno', $_POST['anno'], PDO::PARAM_STR);
             $checkStmt->execute();
             $result = $checkStmt->fetch(PDO::FETCH_ASSOC);
-            
+
             if ($result['total'] > 0) {
                 throw new Exception('El estudiante ya tiene una matrícula activa para este año.');
             }
-            
-            $query = "INSERT INTO tbl_matricula (id_estudiante, id_seccion, id_periodo, anno, estado) 
-                      VALUES (:id_estudiante, :id_seccion, :id_periodo, :anno, :estado)";
+
+            // tbl_matricula no tiene columna id_institucion (se confirmó
+            // contra el esquema real) — insertarla aquí bloqueaba TODA
+            // matrícula nueva. El estudiante y la sección ya fueron
+            // verificados como propios de este tenant arriba.
+            //
+            // id_periodo YA NO se pide ni se guarda: la matrícula es una
+            // sola vez por año lectivo (el chequeo de arriba ya lo impone),
+            // no por trimestre -- pedir un "Período" al matricular sugería
+            // falsamente que había que volver a matricular a cada estudiante
+            // en cada trimestre. Ver el mismo cambio y su razón completa en
+            // el commit "Quitar el filtro de 'período'...".
+            $query = "INSERT INTO tbl_matricula (id_estudiante, id_seccion, anno, estado)
+                      VALUES (:id_estudiante, :id_seccion, :anno, :estado)";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id_estudiante', $_POST['id_estudiante'], PDO::PARAM_INT);
             $stmt->bindValue(':id_seccion', $_POST['id_seccion'], PDO::PARAM_INT);
-            $stmt->bindValue(':id_periodo', $_POST['id_periodo'], PDO::PARAM_INT);
             $stmt->bindValue(':anno', $_POST['anno'], PDO::PARAM_STR);
             $stmt->bindValue(':estado', $_POST['estado'] ?? 'activo', PDO::PARAM_STR);
             $stmt->execute();
-            
+
             $db->commit();
             $mensaje = 'Matrícula creada exitosamente';
             $tipo_mensaje = 'success';
         }
-        
+
         // ACTUALIZAR MATRÍCULA
         elseif ($accion == 'actualizar') {
-            $query = "UPDATE tbl_matricula SET id_seccion = :id_seccion, id_periodo = :id_periodo, 
+            TenantGuard::assertOwner($db, 'tbl_matricula', (int)$_POST['id_matricula']);
+            TenantGuard::assertOwner($db, 'tbl_seccion', (int)$_POST['id_seccion']);
+
+            $query = "UPDATE tbl_matricula SET id_seccion = :id_seccion,
                       estado = :estado WHERE id = :id";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id_seccion', $_POST['id_seccion'], PDO::PARAM_INT);
-            $stmt->bindValue(':id_periodo', $_POST['id_periodo'], PDO::PARAM_INT);
             $stmt->bindValue(':estado', $_POST['estado'], PDO::PARAM_STR);
             $stmt->bindValue(':id', $_POST['id_matricula'], PDO::PARAM_INT);
             $stmt->execute();
-            
+
             $db->commit();
             $mensaje = 'Matrícula actualizada exitosamente';
             $tipo_mensaje = 'success';
         }
-        
+
         // ELIMINAR MATRÍCULA (Marcar como retirado)
         elseif ($accion == 'eliminar') {
             $id_matricula = $_POST['id_matricula'];
-            
+            TenantGuard::assertOwner($db, 'tbl_matricula', (int)$id_matricula);
+
             $query = "UPDATE tbl_matricula SET estado = 'retirado' WHERE id = :id";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id', $id_matricula, PDO::PARAM_INT);
             $stmt->execute();
-            
+
             $db->commit();
             $mensaje = 'Matrícula marcada como retirada';
             $tipo_mensaje = 'warning';
         }
-        
+
     } catch (Exception $e) {
         $db->rollBack();
         $mensaje = 'Error: ' . $e->getMessage();
@@ -100,38 +119,62 @@ $busqueda = $_GET['busqueda'] ?? '';
 
 // ===== DEBUG INFO =====
 $debug_info = [];
-$debug_info['total_estudiantes'] = $db->query("SELECT COUNT(*) FROM tbl_estudiante")->fetchColumn();
-$debug_info['con_matricula'] = $db->prepare("SELECT COUNT(*) FROM tbl_matricula WHERE anno = ? AND estado = 'activo'");
-$debug_info['con_matricula']->execute([$filtro_anno]);
+$stmtTE = $db->prepare("SELECT COUNT(*) FROM tbl_estudiante WHERE id_institucion = :tid");
+$stmtTE->execute([':tid' => $tid]);
+$debug_info['total_estudiantes'] = $stmtTE->fetchColumn();
+
+// tbl_matricula no tiene columna id_institucion; se acota por institución
+// vía tbl_estudiante.
+$debug_info['con_matricula'] = $db->prepare("SELECT COUNT(*) FROM tbl_matricula m JOIN tbl_estudiante e ON m.id_estudiante = e.id WHERE m.anno = ? AND m.estado = 'activo' AND e.id_institucion = ?");
+$debug_info['con_matricula']->execute([$filtro_anno, $tid]);
 $debug_info['con_matricula'] = $debug_info['con_matricula']->fetchColumn();
-$debug_info['total_secciones'] = $db->query("SELECT COUNT(*) FROM tbl_seccion")->fetchColumn();
+
+$stmtTS = $db->prepare("SELECT COUNT(*) FROM tbl_seccion WHERE id_institucion = :tid");
+$stmtTS->execute([':tid' => $tid]);
+$debug_info['total_secciones'] = $stmtTS->fetchColumn();
 
 // ===== OBTENER ESTUDIANTES SIN MATRÍCULA =====
 $queryEstudiantes = "SELECT e.id, p.primer_nombre, p.segundo_nombre, p.primer_apellido, e.nie
                      FROM tbl_estudiante e
                      JOIN tbl_persona p ON e.id_persona = p.id
-                     WHERE e.id NOT IN (
-                         SELECT id_estudiante FROM tbl_matricula 
+                     WHERE e.id_institucion = :tid AND e.id NOT IN (
+                         SELECT id_estudiante FROM tbl_matricula
                          WHERE anno = :anno AND estado = 'activo'
                      )
                      ORDER BY p.primer_apellido, p.primer_nombre";
 
 $stmtEstudiantes = $db->prepare($queryEstudiantes);
-$stmtEstudiantes->execute([':anno' => $filtro_anno]);
+$stmtEstudiantes->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $estudiantes_sin_matricula = $stmtEstudiantes->fetchAll(PDO::FETCH_ASSOC);
 
 // ===== OBTENER SECCIONES =====
 $query_secciones = "SELECT s.id, s.nombre, g.id as id_grado, g.nombre as grado_nombre
                    FROM tbl_seccion s
                    JOIN tbl_grado g ON s.id_grado = g.id
+                   WHERE s.id_institucion = :tid
                    ORDER BY g.nombre, s.nombre";
-$secciones = $db->query($query_secciones)->fetchAll(PDO::FETCH_ASSOC);
+$stmtSecc = $db->prepare($query_secciones);
+$stmtSecc->execute([':tid' => $tid]);
+$secciones = $stmtSecc->fetchAll(PDO::FETCH_ASSOC);
 
 // ===== OBTENER GRADOS =====
-$grados = $db->query("SELECT id, nombre FROM tbl_grado ORDER BY nombre")->fetchAll(PDO::FETCH_ASSOC);
+// tbl_grado es un catálogo GLOBAL a propósito (id_institucion siempre es
+// NULL, ver config/CatalogoAcademico.php) -- filtrar "WHERE id_institucion
+// = :tid" aquí devolvía SIEMPRE 0 filas y el <select> de Grado nunca tenía
+// opciones (mismo bug reportado en gestionar_estudiantes.php). Se listan
+// solo los grados que esta institución realmente usa (con al menos una
+// sección propia), no los 15 del catálogo completo.
+$stmtGrad = $db->prepare("SELECT DISTINCT g.id, g.nombre, g.nivel
+                          FROM tbl_grado g
+                          JOIN tbl_seccion s ON s.id_grado = g.id
+                          WHERE s.id_institucion = :tid
+                          ORDER BY g.nivel, g.nombre");
+$stmtGrad->execute([':tid' => $tid]);
+$grados = $stmtGrad->fetchAll(PDO::FETCH_ASSOC);
+$niveles_label = ['basica' => 'Educación Básica', 'bachillerato' => 'Bachillerato'];
 
 // ===== OBTENER MATRÍCULAS =====
-$query = "SELECT m.id, m.anno, m.estado, m.id_periodo,
+$query = "SELECT m.id, m.anno, m.estado,
           e.id as id_estudiante, e.nie,
           p.primer_nombre, p.segundo_nombre, p.primer_apellido,
           g.id as id_grado, g.nombre as grado_nombre,
@@ -141,9 +184,9 @@ $query = "SELECT m.id, m.anno, m.estado, m.id_periodo,
           JOIN tbl_persona p ON e.id_persona = p.id
           JOIN tbl_seccion s ON m.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
-          WHERE m.anno = :anno";
+          WHERE m.anno = :anno AND e.id_institucion = :tid";
 
-$params = [':anno' => $filtro_anno];
+$params = [':anno' => $filtro_anno, ':tid' => $tid];
 
 if ($filtro_estado == 'activo') {
     $query .= " AND m.estado = 'activo'";
@@ -176,7 +219,6 @@ $stmt->execute();
 $matriculas = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Datos auxiliares
-$periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Trimestre', 4 => 'Cuarto Trimestre'];
 $anios = range(date('Y') - 2, date('Y') + 1);
 ?>
 <!DOCTYPE html>
@@ -218,6 +260,7 @@ $anios = range(date('Y') - 2, date('Y') + 1);
             <a class="nav-link" href="gestionar_profesores.php"><i class="fas fa-chalkboard-teacher"></i> Profesores</a>
             <a class="nav-link" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link active" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
+            <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </div>
@@ -301,19 +344,19 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                 </div>
                 <div class="col-md-2">
                     <label class="form-label">Grado</label>
-                    <select name="grado" class="form-select">
+                    <select name="grado" id="filtro_grado" class="form-select" onchange="actualizarSeccionesFiltro()">
                         <option value="">Todos</option>
-                        <?php foreach ($grados as $grado): ?>
+                        <?php $nivel_actual = null; foreach ($grados as $grado): if ($grado['nivel'] !== $nivel_actual): if ($nivel_actual !== null) echo '</optgroup>'; echo '<optgroup label="' . htmlspecialchars($niveles_label[$grado['nivel']] ?? $grado['nivel']) . '">'; $nivel_actual = $grado['nivel']; endif; ?>
                         <option value="<?= $grado['id'] ?>" <?= $filtro_grado == $grado['id'] ? 'selected' : '' ?>><?= htmlspecialchars($grado['nombre']) ?></option>
-                        <?php endforeach; ?>
+                        <?php endforeach; if ($nivel_actual !== null) echo '</optgroup>'; ?>
                     </select>
                 </div>
                 <div class="col-md-2">
                     <label class="form-label">Sección</label>
-                    <select name="seccion" class="form-select">
+                    <select name="seccion" id="filtro_seccion" class="form-select">
                         <option value="">Todas</option>
                         <?php foreach ($secciones as $seccion): ?>
-                        <option value="<?= $seccion['id'] ?>" <?= $filtro_seccion == $seccion['id'] ? 'selected' : '' ?>><?= htmlspecialchars($seccion['nombre']) ?></option>
+                        <option value="<?= $seccion['id'] ?>" data-grado="<?= $seccion['id_grado'] ?>" <?= $filtro_seccion == $seccion['id'] ? 'selected' : '' ?>><?= htmlspecialchars($seccion['grado_nombre']) ?> "<?= htmlspecialchars($seccion['nombre']) ?>"</option>
                         <?php endforeach; ?>
                     </select>
                 </div>
@@ -348,15 +391,16 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                                 <th>Estudiante</th>
                                 <th>NIE</th>
                                 <th>Grado/Sección</th>
-                                <th>Período</th>
+                                <th>Año</th>
                                 <th>Estado</th>
                                 <th>Acciones</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($matriculas)): ?>
-                            <tr><td colspan="6" class="text-center py-5 text-muted"><i class="fas fa-inbox fa-3x mb-3 d-block"></i>No hay matrículas registradas</td></tr>
-                            <?php else: ?>
+                            <?php // Sin fila manual de "sin datos": con DataTables, una tbody con una
+                            // sola fila de 1 <td colspan> frente a un thead de más columnas dispara
+                            // "Incorrect column count" (tn/18). Con tbody vacío, DataTables muestra
+                            // su propio mensaje localizado (idioma es-ES cargado abajo). ?>
                             <?php foreach ($matriculas as $mat): ?>
                             <tr>
                                 <td>
@@ -377,7 +421,7 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                                     <div><strong><?= htmlspecialchars($mat['grado_nombre']) ?></strong></div>
                                     <span class="badge bg-info"><?= htmlspecialchars($mat['seccion_nombre']) ?></span>
                                 </td>
-                                <td><?= $periodos[$mat['id_periodo']] ?? 'N/A' ?></td>
+                                <td><?= $mat['anno'] ?></td>
                                 <td><span class="estado-badge estado-<?= $mat['estado'] ?>"><?= ucfirst($mat['estado']) ?></span></td>
                                 <td>
                                     <button class="btn btn-sm btn-danger" onclick="eliminarMatricula(<?= $mat['id'] ?>, '<?= htmlspecialchars($mat['primer_nombre']) ?>')" title="Marcar como retirado">
@@ -386,7 +430,6 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -447,17 +490,6 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                             </select>
                         </div>
                         
-                        <!-- Período -->
-                        <div class="mb-3">
-                            <label class="form-label">Período *</label>
-                            <select name="id_periodo" class="form-select" required>
-                                <option value="">Seleccionar período</option>
-                                <?php foreach ($periodos as $key => $val): ?>
-                                <option value="<?= $key ?>"><?= $val ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        
                         <!-- Año -->
                         <div class="mb-3">
                             <label class="form-label">Año Lectivo *</label>
@@ -466,8 +498,9 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                                 <option value="<?= $anio ?>" <?= $anio == $filtro_anno ? 'selected' : '' ?>><?= $anio ?></option>
                                 <?php endforeach; ?>
                             </select>
+                            <small class="text-muted">La matrícula cubre todo el año lectivo -- no hace falta repetirla por período.</small>
                         </div>
-                        
+
                         <!-- Estado -->
                         <div class="mb-3">
                             <label class="form-label">Estado *</label>
@@ -495,7 +528,26 @@ $anios = range(date('Y') - 2, date('Y') + 1);
     <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
     
     <script>
+        // Se repuebla el <select> de Sección del filtro con solo las
+        // secciones del grado elegido (usa el data-grado ya renderizado en
+        // cada <option>, sin otra consulta al servidor). Sin grado elegido,
+        // se muestran todas las secciones del tenant.
+        function actualizarSeccionesFiltro() {
+            const idGrado = $('#filtro_grado').val();
+            const valorActual = $('#filtro_seccion').val();
+            $('#filtro_seccion option').each(function() {
+                const esTodas = $(this).val() === '';
+                const perteneceAlGrado = !idGrado || $(this).data('grado') == idGrado;
+                $(this).toggle(esTodas || perteneceAlGrado);
+            });
+            if (valorActual && !$(`#filtro_seccion option[value="${valorActual}"]`).is(':visible')) {
+                $('#filtro_seccion').val('');
+            }
+        }
+
         $(document).ready(function() {
+            actualizarSeccionesFiltro(); // aplica el filtro también al cargar la página (p.ej. con ?grado= en la URL)
+
             $('#tablaMatriculas').DataTable({
                 language: {
                     url: '//cdn.datatables.net/plug-ins/1.13.4/i18n/es-ES.json'
@@ -503,7 +555,7 @@ $anios = range(date('Y') - 2, date('Y') + 1);
                 pageLength: 10,
                 order: [[0, 'asc']]
             });
-            
+
             // Toggle sidebar en móvil
             $('#sidebarToggle').click(function() {
                 $('#sidebar').toggleClass('active');

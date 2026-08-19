@@ -3,6 +3,15 @@ session_start();
 require_once __DIR__ . '/../../config/database.php';
 include 'functions/video_functions.php';
 
+// Verificar autenticación
+if (!isset($_SESSION['user_id'])) {
+    header("Location: " . BASE_URL . "/login.php");
+    exit;
+}
+
+$database = new Database();
+$db = $database->getConnection();
+
 $id_video = $_GET['id'] ?? 0;
 $id_leccion = $_GET['leccion'] ?? 0;
 

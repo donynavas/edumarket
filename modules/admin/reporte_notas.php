@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar autenticación y roles permitidos
 if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'director', 'profesor'])) {
@@ -12,6 +13,7 @@ $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 $rol = $_SESSION['rol'];
+$tid = TenantGuard::id();
 
 // ===== FUNCIÓN AUXILIAR: Verificar si existe una tabla =====
 function tableExists($db, $tableName) {
@@ -28,7 +30,6 @@ function tableExists($db, $tableName) {
 
 // ===== CONFIGURACIÓN DE FILTROS =====
 $filtro_anno = $_GET['anno'] ?? date('Y');
-$filtro_periodo = $_GET['periodo'] ?? 1;
 $filtro_grado = $_GET['grado'] ?? '';
 $filtro_seccion = $_GET['seccion'] ?? '';
 $filtro_asignatura = $_GET['asignatura'] ?? '';
@@ -37,13 +38,9 @@ $filtro_estado = $_GET['estado'] ?? 'todos';
 $ordenar_por = $_GET['ordenar'] ?? 'apellido';
 
 // ===== DATOS PARA FILTROS =====
-$periodos = [
-    1 => ['nombre' => 'Primer Trimestre', 'inicio' => '01/01', 'fin' => '31/03'],
-    2 => ['nombre' => 'Segundo Trimestre', 'inicio' => '01/04', 'fin' => '30/06'],
-    3 => ['nombre' => 'Tercer Trimestre', 'inicio' => '01/07', 'fin' => '30/09'],
-    4 => ['nombre' => 'Cuarto Trimestre', 'inicio' => '01/10', 'fin' => '31/12']
-];
-
+// NOTA: ya no hay selector de "período" (entero legado 1-4, sin relación con
+// tbl_periodo real) -- una asignación docente y una matrícula duran el año
+// lectivo completo. Ver la misma nota en estudiante_dashboard.php.
 $anios = range(date('Y') - 3, date('Y') + 1);
 
 // Obtener grados
@@ -51,26 +48,34 @@ $query = "SELECT id, nombre, nivel, nota_minima_aprobacion FROM tbl_grado ORDER 
 $grados = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
 
 // Obtener secciones
-$query = "SELECT s.id, s.nombre, g.nombre as grado_nombre, g.nivel 
-          FROM tbl_seccion s 
-          JOIN tbl_grado g ON s.id_grado = g.id 
+$query = "SELECT s.id, s.nombre, g.nombre as grado_nombre, g.nivel
+          FROM tbl_seccion s
+          JOIN tbl_grado g ON s.id_grado = g.id
+          WHERE s.id_institucion = :tid
           ORDER BY g.nombre, s.nombre";
-$secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+$stmt = $db->prepare($query);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt->execute();
+$secciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Obtener asignaturas
-$query = "SELECT id, nombre, codigo FROM tbl_asignatura ORDER BY nombre";
-$asignaturas = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+$query = "SELECT id, nombre, codigo FROM tbl_asignatura WHERE id_institucion = :tid ORDER BY nombre";
+$stmt = $db->prepare($query);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt->execute();
+$asignaturas = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Si es profesor, filtrar por sus asignaciones
 $asignaciones_profesor = [];
 if ($rol == 'profesor') {
-    $query = "SELECT ad.id, ad.id_asignatura 
+    $query = "SELECT ad.id, ad.id_asignatura
               FROM tbl_asignacion_docente ad
               JOIN tbl_profesor p ON ad.id_profesor = p.id
               JOIN tbl_persona per ON p.id_persona = per.id
-              WHERE per.id_usuario = :user_id";
+              WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
     $stmt = $db->prepare($query);
     $stmt->bindParam(':user_id', $user_id);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $asignaciones_profesor = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
@@ -79,11 +84,10 @@ if ($rol == 'profesor') {
     }
 }
 
-// ===== CONSULTA PRINCIPAL DE REPORTES - ✅ CORREGIDA =====
-// NOTA: act.id_periodo NO EXISTE, usar ad.id_periodo de tbl_asignacion_docente
-$query = "SELECT 
+// ===== CONSULTA PRINCIPAL DE REPORTES =====
+$query = "SELECT
     m.id as id_matricula,
-    m.anno, m.id_periodo, m.estado as estado_matricula,
+    m.anno, m.estado as estado_matricula,
     
     -- Datos del estudiante
     e.id as id_estudiante, e.nie,
@@ -96,23 +100,30 @@ $query = "SELECT
     asig.id as id_asignatura, asig.nombre as asignatura_nombre, asig.codigo as codigo_asignatura,
     
     -- Estadísticas de calificaciones
+    --
+    -- Un examen calificado no deja fila en tbl_entrega_actividad (su nota
+    -- vive en tbl_intento_examen) -- sin vw_logro_estudiante
+    -- (migrations/2026_08_16_vista_logro_estudiante.sql) este reporte
+    -- tampoco veía exámenes calificados: promedio en NULL y estado
+    -- pendiente aunque el estudiante ya hubiera presentado y aprobado un
+    -- examen.
     COUNT(DISTINCT act.id) as total_actividades,
-    COUNT(DISTINCT CASE WHEN ea.nota_obtenida IS NOT NULL THEN ea.id END) as actividades_calificadas,
-    AVG(ea.nota_obtenida) as promedio_notas,
-    MIN(ea.nota_obtenida) as nota_minima,
-    MAX(ea.nota_obtenida) as nota_maxima,
-    
+    COUNT(DISTINCT CASE WHEN v.estado_entrega = 'calificado' THEN act.id END) as actividades_calificadas,
+    AVG(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) as promedio_notas,
+    MIN(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) as nota_minima,
+    MAX(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) as nota_maxima,
+
     -- Asistencia
     COUNT(DISTINCT CASE WHEN ast.estado = 'presente' THEN ast.id END) as asistencias_presente,
     COUNT(DISTINCT ast.id) as total_asistencias,
-    
+
     -- Cálculo de aprobación
-    CASE 
-        WHEN AVG(ea.nota_obtenida) >= g.nota_minima_aprobacion THEN 'aprobado'
-        WHEN AVG(ea.nota_obtenida) IS NOT NULL THEN 'reprobado'
+    CASE
+        WHEN AVG(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) >= g.nota_minima_aprobacion THEN 'aprobado'
+        WHEN AVG(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) IS NOT NULL THEN 'reprobado'
         ELSE 'pendiente'
     END as estado_aprobacion
-    
+
 FROM tbl_matricula m
 JOIN tbl_estudiante e ON m.id_estudiante = e.id
 JOIN tbl_persona p ON e.id_persona = p.id
@@ -120,19 +131,17 @@ JOIN tbl_seccion s ON m.id_seccion = s.id
 JOIN tbl_grado g ON s.id_grado = g.id
 JOIN tbl_asignacion_docente ad ON s.id = ad.id_seccion AND m.anno = ad.anno
 JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
-LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente 
-    AND ad.id_periodo = :periodo  -- ✅ CORRECCIÓN: Usar ad.id_periodo, NO act.id_periodo
-LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad AND m.id = ea.id_matricula
+LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente
+LEFT JOIN vw_logro_estudiante v ON act.id = v.id_actividad AND m.id = v.id_matricula
 LEFT JOIN tbl_asistencia ast ON m.id = ast.id_matricula
 
 WHERE m.anno = :anno
-AND m.id_periodo = :periodo2  -- ✅ Usar m.id_periodo de tbl_matricula
-AND m.estado = 'activo'";
+AND m.estado = 'activo'
+AND e.id_institucion = :tid";
 
 $params = [
     ':anno' => $filtro_anno,
-    ':periodo' => $filtro_periodo,
-    ':periodo2' => $filtro_periodo
+    ':tid' => $tid
 ];
 
 // Filtros adicionales
@@ -166,11 +175,11 @@ if (!empty($filtro_estudiante)) {
 }
 
 if ($filtro_estado == 'aprobados') {
-    $query .= " HAVING AVG(ea.nota_obtenida) >= g.nota_minima_aprobacion";
+    $query .= " HAVING promedio_notas >= g.nota_minima_aprobacion";
 } elseif ($filtro_estado == 'reprobados') {
-    $query .= " HAVING AVG(ea.nota_obtenida) < g.nota_minima_aprobacion AND AVG(ea.nota_obtenida) IS NOT NULL";
+    $query .= " HAVING promedio_notas < g.nota_minima_aprobacion AND promedio_notas IS NOT NULL";
 } elseif ($filtro_estado == 'pendientes') {
-    $query .= " HAVING AVG(ea.nota_obtenida) IS NULL";
+    $query .= " HAVING promedio_notas IS NULL";
 }
 
 // Ordenamiento
@@ -210,24 +219,24 @@ if (!empty($promedios_validos)) {
 // ===== DETALLE DE ACTIVIDADES POR ESTUDIANTE =====
 $actividades_detalle = [];
 if (!empty($filtro_asignatura)) {
-    // ✅ CORRECCIÓN: Usar ad.id_periodo, NO act.id_periodo
-    $query_act = "SELECT 
+    $query_act = "SELECT
         act.id, act.titulo, act.tipo, act.fecha_programada, act.nota_maxima,
-        ea.nota_obtenida, ea.observacion_docente, ea.estado_entrega,
+        v.nota_obtenida, v.observacion_docente, v.estado_entrega,
         m.id as id_matricula
         FROM tbl_actividad act
         JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
-        LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad
-        LEFT JOIN tbl_matricula m ON ea.id_matricula = m.id
+        JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
+        LEFT JOIN vw_logro_estudiante v ON act.id = v.id_actividad
+        LEFT JOIN tbl_matricula m ON v.id_matricula = m.id
         WHERE ad.id_asignatura = :asignatura
-        AND ad.id_periodo = :periodo  -- ✅ CORRECCIÓN
         AND ad.anno = :anno
+        AND asig.id_institucion = :tid
         ORDER BY act.fecha_programada";
     $stmt_act = $db->prepare($query_act);
     $stmt_act->execute([
         ':asignatura' => $filtro_asignatura,
-        ':periodo' => $filtro_periodo,
-        ':anno' => $filtro_anno
+        ':anno' => $filtro_anno,
+        ':tid' => $tid
     ]);
     $actividades_detalle = $stmt_act->fetchAll(PDO::FETCH_ASSOC);
 }
@@ -675,6 +684,9 @@ $estados_aprobacion = [
             <a class="nav-link" href="calificaciones.php">
                 <i class="fas fa-star"></i> Calificaciones
             </a>
+            <a class="nav-link" href="cuadro_notas.php">
+                <i class="fas fa-clipboard-list"></i> Cuadro de Notas
+            </a>
             <a class="nav-link active" href="reporte_notas.php">
                 <i class="fas fa-chart-bar"></i> Reportes
             </a>
@@ -809,16 +821,6 @@ $estados_aprobacion = [
                     </select>
                 </div>
                 <div class="col-lg-2 col-md-4 col-sm-6">
-                    <label class="filter-label">Período</label>
-                    <select name="periodo" class="form-select form-select-sm" onchange="this.form.submit()">
-                        <?php foreach ($periodos as $key => $periodo): ?>
-                        <option value="<?= $key ?>" <?= $filtro_periodo == $key ? 'selected' : '' ?>>
-                            <?= $periodo['nombre'] ?>
-                        </option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-                <div class="col-lg-2 col-md-4 col-sm-6">
                     <label class="filter-label">Grado</label>
                     <select name="grado" class="form-select form-select-sm" onchange="this.form.submit()">
                         <option value="">Todos</option>
@@ -908,15 +910,11 @@ $estados_aprobacion = [
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($reporte)): ?>
-                            <tr>
-                                <td colspan="7" class="text-center py-5 text-muted">
-                                    <i class="fas fa-inbox fa-3x mb-3 d-block"></i>
-                                    No se encontraron registros con los filtros seleccionados
-                                </td>
-                            </tr>
-                            <?php else: ?>
-                            <?php foreach ($reporte as $row): 
+                            <?php // Sin fila manual de "sin datos": con DataTables, una tbody con
+                            // una sola fila de 1 <td colspan> frente a un thead de más columnas
+                            // dispara "Incorrect column count" (tn/18). Con tbody vacío, DataTables
+                            // muestra su propio mensaje localizado (idioma es-ES cargado abajo). ?>
+                            <?php foreach ($reporte as $row):
                                 $nota_min = $row['nota_minima_aprobacion'];
                                 $promedio = $row['promedio_notas'];
                                 $estado = $row['estado_aprobacion'];
@@ -1002,7 +1000,6 @@ $estados_aprobacion = [
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>

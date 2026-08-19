@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -11,9 +12,10 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del estudiante y matrícula
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante,
           m.id as id_matricula, m.anno, m.id_periodo,
           s.id as id_seccion,
@@ -26,10 +28,12 @@ $query = "SELECT
           JOIN tbl_grado g ON s.id_grado = g.id
           WHERE p.id_usuario = :user_id
           AND m.estado = 'activo'
+          AND e.id_institucion = :tid
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $datos = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -49,24 +53,33 @@ $nota_minima = $datos['nota_minima_aprobacion'] ?? 7.0;
 $filtro_materia = $_GET['materia'] ?? '';
 
 // ✅ CORREGIDO: Eliminado 'asig.color' que no existe
-$query_notas = "SELECT 
-    act.titulo, 
-    act.nota_maxima, 
+//
+// Las notas de examen NO viven en tbl_entrega_actividad (esa tabla es
+// solo para tareas calificadas por el profesor) -- viven en
+// tbl_intento_examen. vw_logro_estudiante (migrations/2026_08_16_vista_
+// logro_estudiante.sql) unifica ambas fuentes en una sola vista de
+// lectura -- ver esa migración para el detalle de por qué existe. Un
+// simple JOIN a la vista reemplaza el UNION ALL manual que tenía antes
+// esta consulta.
+$query_notas = "SELECT
+    act.titulo,
+    act.nota_maxima,
     act.tipo,
     act.fecha_limite,
-    ea.nota_obtenida, 
-    ea.estado_entrega, 
-    ea.observacion_docente,
+    v.nota_obtenida,
+    v.estado_entrega,
+    v.observacion_docente,
+    asig.id as id_asignatura,
     asig.nombre as asignatura,
-    prof.primer_nombre as prof_nombre, 
+    prof.primer_nombre as prof_nombre,
     prof.primer_apellido as prof_apellido
-    FROM tbl_entrega_actividad ea
-    JOIN tbl_actividad act ON ea.id_actividad = act.id
+    FROM vw_logro_estudiante v
+    JOIN tbl_actividad act ON v.id_actividad = act.id
     JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
     JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
     JOIN tbl_profesor pf ON ad.id_profesor = pf.id
     JOIN tbl_persona prof ON pf.id_persona = prof.id
-    WHERE ea.id_matricula = :id_matricula
+    WHERE v.id_matricula = :id_matricula
     AND act.estado = 'activo'";
 
 $params = [':id_matricula' => $id_matricula];

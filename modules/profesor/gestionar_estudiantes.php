@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea profesor
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
@@ -11,14 +12,16 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del profesor
 $query = "SELECT p.id as id_profesor, per.primer_nombre, per.primer_apellido, per.email
           FROM tbl_profesor p
           JOIN tbl_persona per ON p.id_persona = per.id
-          WHERE per.id_usuario = :user_id";
+          WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $profesor = $stmt->fetch(PDO::FETCH_ASSOC);
 $id_profesor = $profesor['id_profesor'] ?? 0;
@@ -38,13 +41,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $id_matricula = filter_input(INPUT_POST, 'id_matricula', FILTER_VALIDATE_INT);
             $nuevo_estado = $_POST['estado'] ?? 'activo';
             
+            // tbl_matricula no tiene columna id_institucion; el aislamiento
+            // por tenant ya queda garantizado por ad.id_profesor = :id_profesor
+            // ($id_profesor viene de una consulta anterior filtrada por tenant).
             $check = $db->prepare("
                 SELECT m.id FROM tbl_matricula m
                 JOIN tbl_asignacion_docente ad ON m.id_seccion = ad.id_seccion AND m.anno = ad.anno
                 WHERE m.id = :id_matricula AND ad.id_profesor = :id_profesor
             ");
             $check->execute([':id_matricula' => $id_matricula, ':id_profesor' => $id_profesor]);
-            
+
             if ($check->rowCount() > 0) {
                 $query = "UPDATE tbl_matricula SET estado = :estado, fecha_actualizacion = NOW() WHERE id = :id";
                 $stmt = $db->prepare($query);
@@ -67,9 +73,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 SELECT e.id FROM tbl_estudiante e
                 JOIN tbl_matricula m ON e.id = m.id_estudiante
                 JOIN tbl_asignacion_docente ad ON m.id_seccion = ad.id_seccion AND m.anno = ad.anno
-                WHERE e.id = :id_estudiante AND ad.id_profesor = :id_profesor
+                WHERE e.id = :id_estudiante AND ad.id_profesor = :id_profesor AND e.id_institucion = :tid
             ");
-            $check->execute([':id_estudiante' => $id_estudiante, ':id_profesor' => $id_profesor]);
+            $check->execute([':id_estudiante' => $id_estudiante, ':id_profesor' => $id_profesor, ':tid' => $tid]);
             
             if ($check->rowCount() > 0 && !empty($asunto) && !empty($mensaje_texto)) {
                 // Aquí iría la lógica para enviar mensaje (email o sistema interno)
@@ -96,10 +102,11 @@ $query = "SELECT ad.id, ad.anno, asig.nombre as asignatura_nombre,
           JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
           JOIN tbl_seccion s ON ad.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
-          WHERE ad.id_profesor = :id_profesor
+          WHERE ad.id_profesor = :id_profesor AND asig.id_institucion = :tid
           ORDER BY g.nombre, s.nombre, asig.nombre";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':id_profesor', $id_profesor, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $asignaciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -114,8 +121,11 @@ $total_estudiantes = 0;
 
 if ($id_asignacion_filtro) {
     try {
-        // ✅ CONSULTA CORREGIDA: Usa ea.id en lugar de ea.id_estudiante
-        $query_est = "SELECT 
+        // tbl_entrega_actividad no tiene columna id_estudiante (sólo
+        // id_matricula); el join anterior comparaba e.id = ea.id (la PK de
+        // la propia entrega), lo que emparejaba estudiantes con entregas al
+        // azar por coincidencia de ids en vez de por relación real.
+        $query_est = "SELECT
                      e.id as id_estudiante,
                      p.primer_nombre,
                      p.primer_apellido,
@@ -124,17 +134,22 @@ if ($id_asignacion_filtro) {
                      e.nie,
                      m.id as id_matricula,
                      m.estado as estado_matricula,
-                     COUNT(ea.id) as total_entregas,  -- ✅ CAMBIADO: ea.id en lugar de ea.id_estudiante
+                     COUNT(ea.id) as total_entregas,
                      AVG(ea.nota_obtenida) as promedio_general,
                      MAX(ea.fecha_entrega) as ultima_entrega
                      FROM tbl_estudiante e
                      JOIN tbl_persona p ON e.id_persona = p.id
                      JOIN tbl_matricula m ON e.id = m.id_estudiante
-                     LEFT JOIN tbl_entrega_actividad ea ON e.id = ea.id  -- ⚠️ Si esto falla, cambiar por el nombre correcto
-                     WHERE m.id_seccion = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :id_asig)
-                     AND m.anno = (SELECT anno FROM tbl_asignacion_docente WHERE id = :id_asig2)";
-        
-        $params = [':id_asig' => $id_asignacion_filtro, ':id_asig2' => $id_asignacion_filtro];
+                     LEFT JOIN tbl_entrega_actividad ea ON m.id = ea.id_matricula
+                     WHERE m.id_seccion = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :id_asig AND id_profesor = :id_prof)
+                     AND m.anno = (SELECT anno FROM tbl_asignacion_docente WHERE id = :id_asig2 AND id_profesor = :id_prof2)
+                     AND e.id_institucion = :tid3";
+
+        $params = [
+            ':id_asig' => $id_asignacion_filtro, ':id_prof' => $id_profesor,
+            ':id_asig2' => $id_asignacion_filtro, ':id_prof2' => $id_profesor,
+            ':tid3' => $tid
+        ];
         
         // Filtro de búsqueda
         if (!empty($busqueda)) {
@@ -188,85 +203,38 @@ if ($estadisticas['activos'] > 0) {
     $estadisticas['promedio_general'] = round($estadisticas['promedio_general'] / $estadisticas['activos'], 2);
 }
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gestión de Estudiantes - Educación Plus</title>
-    
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet">
-    
-    <style>
-        :root { --primary: #2c3e50; --secondary: #3498db; --success: #2ecc71; --warning: #f39c12; --danger: #e74c3c; --sidebar-width: 260px; }
-        body { font-family: 'Segoe UI', sans-serif; background: #f5f7fa; }
-        .sidebar { position: fixed; top: 0; left: 0; height: 100vh; width: var(--sidebar-width); background: var(--primary); color: white; padding-top: 20px; z-index: 1000; overflow-y: auto; }
-        .sidebar .nav-link { color: rgba(255,255,255,0.85); padding: 12px 20px; margin: 2px 0; border-radius: 8px; }
-        .sidebar .nav-link:hover, .sidebar .nav-link.active { color: white; background: rgba(255,255,255,0.15); }
-        .sidebar .nav-link i { width: 24px; text-align: center; margin-right: 8px; }
-        .main-content { margin-left: var(--sidebar-width); padding: 20px; }
-        .card-custom { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); border: none; margin-bottom: 20px; }
-        .student-avatar { width: 45px; height: 45px; border-radius: 50%; background: linear-gradient(135deg, var(--secondary), var(--primary)); color: white; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.1rem; }
-        .stat-card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; }
-        .stat-card i { font-size: 2.5rem; margin-bottom: 10px; }
-        .stat-card.active i { color: var(--success); }
-        .stat-card.inactive i { color: var(--danger); }
-        .stat-card.average i { color: var(--warning); }
-        .badge-estado { padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
-        .estado-activo { background: #d4edda; color: #155724; }
-        .estado-inactivo { background: #f8d7da; color: #721c24; }
-        .estado-pendiente { background: #fff3cd; color: #856404; }
-        .table-hover tbody tr:hover { background: #f8f9fa; cursor: pointer; }
-        @media (max-width: 992px) { .sidebar { transform: translateX(-100%); } .sidebar.active { transform: translateX(0); } .main-content { margin-left: 0; } }
-    </style>
-</head>
-<body>
-    <!-- Sidebar -->
-    <div class="sidebar" id="sidebar">
-        <div class="text-center mb-4 px-3">
-            <div class="d-flex align-items-center justify-content-center gap-2 mb-2">
-                <div class="bg-white text-primary rounded-circle d-flex align-items-center justify-content-center" style="width: 45px; height: 45px; font-weight: 700;">
-                    <?= strtoupper(substr($profesor['primer_nombre'], 0, 1)) ?>
-                </div>
-                <div class="text-start">
-                    <div class="fw-bold"><?= htmlspecialchars($profesor['primer_nombre']) ?></div>
-                    <small class="text-white-50">Profesor</small>
-                </div>
-            </div>
-        </div>
-        
-        <nav class="nav flex-column px-2">
-            <a class="nav-link" href="aula_virtual.php"><i class="fas fa-chalkboard-teacher"></i> Aula Virtual</a>
-            <a class="nav-link active" href="#"><i class="fas fa-user-graduate"></i> Estudiantes</a>
-            <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
-            <a class="nav-link" href="reportes.php"><i class="fas fa-chart-bar"></i> Reportes</a>
-            <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
-        </nav>
-        
-        <div class="mt-4 px-3">
-            <small class="text-white-50">Mis Asignaciones</small>
-            <div class="mt-2">
-                <?php foreach ($asignaciones as $asig): ?>
-                <a href="?asignacion=<?= $asig['id'] ?>" class="d-block text-white-50 text-decoration-none py-1 px-2 rounded small <?= $id_asignacion_filtro == $asig['id'] ? 'bg-white-10 text-white' : 'hover-bg-white-10' ?>">
-                    <i class="fas fa-chevron-right me-1 small"></i>
-                    <?= htmlspecialchars($asig['asignatura_nombre']) ?> - <?= htmlspecialchars($asig['grado_nombre']) ?> <?= htmlspecialchars($asig['seccion_nombre']) ?>
-                </a>
-                <?php endforeach; ?>
-            </div>
-        </div>
-    </div>
-
-    <!-- Main Content -->
-    <div class="main-content">
+<?php
+$activePage = 'estudiantes';
+$pageTitle = 'Gestión de Estudiantes - Educación Plus';
+$mostrarAsignacionesSidebar = true;
+$idAsignacionFiltro = $id_asignacion_filtro;
+ob_start();
+?>
+<style>
+    .card-custom { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); border: none; margin-bottom: 20px; }
+    .student-avatar { width: 45px; height: 45px; border-radius: 50%; background: linear-gradient(135deg, var(--secondary), var(--primary)); color: white; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.1rem; }
+    .stat-card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; }
+    .stat-card i { font-size: 2.5rem; margin-bottom: 10px; }
+    .stat-card.active i { color: var(--success); }
+    .stat-card.inactive i { color: var(--danger); }
+    .stat-card.average i { color: var(--warning); }
+    .badge-estado { padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+    .estado-activo { background: #d4edda; color: #155724; }
+    .estado-inactivo { background: #f8d7da; color: #721c24; }
+    .estado-pendiente { background: #fff3cd; color: #856404; }
+    .table-hover tbody tr:hover { background: #f8f9fa; cursor: pointer; }
+</style>
+<?php
+$extraHead = ob_get_clean();
+require __DIR__ . '/partials/header.php';
+?>
         <!-- Header -->
         <div class="d-flex justify-content-between align-items-center mb-4">
             <div>
                 <h2 class="mb-1"><i class="fas fa-user-graduate"></i> Gestión de Estudiantes</h2>
                 <nav aria-label="breadcrumb">
                     <ol class="breadcrumb mb-0">
-                        <li class="breadcrumb-item"><a href="aula_virtual.php">Aula Virtual</a></li>
+                        <li class="breadcrumb-item"><a href="profesor_dashboard.php">Dashboard</a></li>
                         <li class="breadcrumb-item active">Estudiantes</li>
                     </ol>
                 </nav>
@@ -515,9 +483,8 @@ if ($estadisticas['activos'] > 0) {
     </div>
 
     <!-- Scripts -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    
+    <?php require __DIR__ . '/partials/scripts.php'; ?>
+
     <script>
     $(document).ready(function() {
         // Sidebar responsive

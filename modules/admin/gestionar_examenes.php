@@ -8,6 +8,8 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['r
     exit;
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
@@ -16,13 +18,69 @@ $rol = $_SESSION['rol'];
 $mensaje = '';
 $tipo_mensaje = '';
 
+// Verifica que $id_asignacion pertenezca, en esta institución, al profesor
+// de la sesión actual (nunca sólo a "algún profesor de la institución").
+// Esto evita que un profesor cree/edite/elimine exámenes de la clase de otro.
+function assertAsignacionDelProfesor(PDO $db, int $id_asignacion, int $user_id, int $tid): void {
+    // tbl_asignacion_docente no tiene columna id_institucion; el aislamiento
+    // por tenant se hace vía tbl_profesor, que sí la tiene.
+    $stmt = $db->prepare(
+        "SELECT ad.id FROM tbl_asignacion_docente ad
+         JOIN tbl_profesor pr ON ad.id_profesor = pr.id
+         JOIN tbl_persona per ON pr.id_persona = per.id
+         WHERE ad.id = :id_asig AND per.id_usuario = :user_id
+           AND pr.id_institucion = :tid"
+    );
+    $stmt->execute([
+        ':id_asig' => $id_asignacion,
+        ':user_id' => $user_id,
+        ':tid' => $tid,
+    ]);
+    if (!$stmt->fetch()) {
+        http_response_code(403);
+        throw new Exception('Esta asignación no pertenece a su cuenta de profesor.');
+    }
+}
+
+// Igual, pero a partir de un id_actividad (examen) ya existente: resuelve su
+// id_asignacion_docente y valida que sea del profesor de la sesión.
+function assertExamenDelProfesor(PDO $db, int $id_actividad, int $user_id, int $tid): void {
+    // Ni tbl_actividad ni tbl_asignacion_docente tienen columna
+    // id_institucion; el aislamiento por tenant se hace vía tbl_profesor.
+    $stmt = $db->prepare(
+        "SELECT a.id FROM tbl_actividad a
+         JOIN tbl_asignacion_docente ad ON a.id_asignacion_docente = ad.id
+         JOIN tbl_profesor pr ON ad.id_profesor = pr.id
+         JOIN tbl_persona per ON pr.id_persona = per.id
+         WHERE a.id = :id_actividad AND a.tipo = 'examen' AND per.id_usuario = :user_id
+           AND pr.id_institucion = :tid"
+    );
+    $stmt->execute([
+        ':id_actividad' => $id_actividad,
+        ':user_id' => $user_id,
+        ':tid' => $tid,
+    ]);
+    if (!$stmt->fetch()) {
+        http_response_code(403);
+        throw new Exception('Este examen no pertenece a una clase suya.');
+    }
+}
+
 // ===== PROCESAR FORMULARIO POST =====
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $accion = $_POST['accion'] ?? '';
     
     try {
         $db->beginTransaction();
-        
+
+        // Sólo el profesor titular de la asignación puede crear, editar,
+        // eliminar o cambiar el estado de un examen. Admin/Director usan
+        // esta pantalla únicamente como vista de supervisión (sólo lectura)
+        // sobre los exámenes de toda la institución.
+        if (in_array($accion, ['crear', 'actualizar', 'eliminar', 'cambiar_estado'], true) && $rol !== 'profesor') {
+            throw new Exception('Sólo el profesor asignado a la clase puede crear, editar o eliminar exámenes.');
+        }
+
         // === CREAR EXAMEN ===
         if ($accion == 'crear') {
             $titulo = trim($_POST['titulo']);
@@ -32,19 +90,26 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $nota_maxima = $_POST['nota_maxima'] ?? 10;
             $estado = $_POST['estado'] ?? 'programado';
             
-            // Validar que la asignación existe
-            $check = $db->prepare("SELECT id FROM tbl_asignacion_docente WHERE id = :id");
-            $check->bindValue(':id', $id_asignacion, PDO::PARAM_INT);
-            $check->execute();
-            if (!$check->fetch()) {
-                throw new Exception('La asignación docente no existe.');
-            }
-            
+            // Validar que la asignación existe, pertenece a esta institución
+            // Y es del profesor de la sesión (no de otro profesor cualquiera).
+            assertAsignacionDelProfesor($db, (int)$id_asignacion, (int)$user_id, (int)$tid);
+
             // INSERT EN tbl_actividad (tipo = examen)
-            $query = "INSERT INTO tbl_actividad (id_asignacion_docente, titulo, descripcion, tipo, 
-                      fecha_programada, fecha_limite, duracion_minutos, nota_maxima, estado, recursos_url) 
-                      VALUES (:id_asignacion, :titulo, :descripcion, 'examen', 
-                              :fecha_programada, :fecha_limite, :duracion, :nota_maxima, :estado, :recursos)";
+            // Nota: tbl_actividad.contenido es NOT NULL sin default; este
+            // formulario no lo captura por separado, así que se completa con
+            // la descripción (igual patrón usado en gestionar_actividades.php
+            // y procesar_actividad.php) para que el INSERT no falle.
+            // tbl_actividad no tiene columna id_institucion (se confirmó
+            // contra el esquema real) — insertarla aquí bloqueaba TODA
+            // creación de examen desde esta pantalla. id_asignacion ya se
+            // verificó como propio del profesor/tenant arriba.
+            // tbl_actividad.duracion_minutos es de tipo TIME en el esquema real
+            // (no INT); se convierte con SEC_TO_TIME para que el valor en
+            // minutos que envía el formulario no rompa el INSERT.
+            $query = "INSERT INTO tbl_actividad (id_asignacion_docente, titulo, descripcion, tipo,
+                      fecha_programada, fecha_limite, duracion_minutos, nota_maxima, estado, recursos_url, contenido)
+                      VALUES (:id_asignacion, :titulo, :descripcion, 'examen',
+                              :fecha_programada, :fecha_limite, SEC_TO_TIME(:duracion * 60), :nota_maxima, :estado, :recursos, :contenido)";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id_asignacion', $id_asignacion, PDO::PARAM_INT);
             $stmt->bindValue(':titulo', $titulo, PDO::PARAM_STR);
@@ -55,6 +120,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $stmt->bindValue(':nota_maxima', $nota_maxima, PDO::PARAM_STR);
             $stmt->bindValue(':estado', $estado, PDO::PARAM_STR);
             $stmt->bindValue(':recursos', $_POST['recursos_url'] ?? '', PDO::PARAM_STR);
+            $stmt->bindValue(':contenido', $_POST['contenido'] ?? ($_POST['descripcion'] ?? ''), PDO::PARAM_STR);
             $stmt->execute();
             $id_actividad = $db->lastInsertId();
             
@@ -74,19 +140,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $nota_maxima = $_POST['nota_maxima'] ?? 10;
             $estado = $_POST['estado'] ?? 'programado';
             
-            // Validar que la actividad es un examen
-            $check = $db->prepare("SELECT id FROM tbl_actividad WHERE id = :id AND tipo = 'examen'");
-            $check->bindValue(':id', $id_actividad, PDO::PARAM_INT);
-            $check->execute();
-            if (!$check->fetch()) {
-                throw new Exception('La actividad no existe o no es un examen.');
-            }
-            
+            // Validar que la actividad es un examen de esta institución Y
+            // pertenece al profesor de la sesión.
+            assertExamenDelProfesor($db, (int)$id_actividad, (int)$user_id, (int)$tid);
+            // Validar que la nueva asignación elegida también es suya (evita
+            // "traspasar" el examen a la clase de otro profesor).
+            assertAsignacionDelProfesor($db, (int)$id_asignacion, (int)$user_id, (int)$tid);
+
             // UPDATE tbl_actividad
-            $query = "UPDATE tbl_actividad SET id_asignacion_docente = :id_asignacion, 
-                      titulo = :titulo, descripcion = :descripcion, 
-                      fecha_programada = :fecha_programada, fecha_limite = :fecha_limite, 
-                      duracion_minutos = :duracion, nota_maxima = :nota_maxima, estado = :estado 
+            // Ver nota arriba: duracion_minutos es TIME en el esquema real.
+            $query = "UPDATE tbl_actividad SET id_asignacion_docente = :id_asignacion,
+                      titulo = :titulo, descripcion = :descripcion,
+                      fecha_programada = :fecha_programada, fecha_limite = :fecha_limite,
+                      duracion_minutos = SEC_TO_TIME(:duracion * 60), nota_maxima = :nota_maxima, estado = :estado
                       WHERE id = :id";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id_asignacion', $id_asignacion, PDO::PARAM_INT);
@@ -106,7 +172,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             
         } elseif ($accion == 'eliminar') {
             $id_actividad = $_POST['id_actividad'];
-            
+            assertExamenDelProfesor($db, (int)$id_actividad, (int)$user_id, (int)$tid);
+
             // Verificar si tiene entregas de estudiantes
             $check = $db->prepare("SELECT COUNT(*) as total FROM tbl_entrega_actividad WHERE id_actividad = :id");
             $check->bindValue(':id', $id_actividad, PDO::PARAM_INT);
@@ -130,7 +197,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         } elseif ($accion == 'cambiar_estado') {
             $id_actividad = $_POST['id_actividad'];
             $estado = $_POST['estado'];
-            
+            assertExamenDelProfesor($db, (int)$id_actividad, (int)$user_id, (int)$tid);
+
             $query = "UPDATE tbl_actividad SET estado = :estado WHERE id = :id AND tipo = 'examen'";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':estado', $estado, PDO::PARAM_STR);
@@ -165,22 +233,27 @@ $filtro_fecha_fin = $_GET['fecha_fin'] ?? '';
 $busqueda = $_GET['busqueda'] ?? '';
 
 // Si es profesor, filtrar por sus asignaciones
+// ✅ Corregido: la subconsulta usaba tbl_usuario.id_persona, columna que no
+// existe (la relación real es tbl_persona.id_usuario -> tbl_usuario.id), por
+// lo que esta rama fallaba siempre para el rol profesor.
 if ($rol == 'profesor') {
-    $query_prof = "SELECT id FROM tbl_asignacion_docente WHERE id_profesor = (
-                   SELECT id FROM tbl_profesor WHERE id_persona = (
-                   SELECT id_persona FROM tbl_usuario WHERE id = :user_id))";
+    $query_prof = "SELECT ad.id FROM tbl_asignacion_docente ad
+                   JOIN tbl_profesor pr ON ad.id_profesor = pr.id
+                   JOIN tbl_persona per ON pr.id_persona = per.id
+                   WHERE per.id_usuario = :user_id AND pr.id_institucion = :tid";
     $stmt_prof = $db->prepare($query_prof);
     $stmt_prof->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt_prof->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt_prof->execute();
     $asignaciones_profesor = $stmt_prof->fetchAll(PDO::FETCH_COLUMN);
-    
+
     if (empty($asignaciones_profesor)) {
         $asignaciones_profesor = [0]; // Para evitar error en IN()
     }
 }
 
-$query = "SELECT a.id, a.titulo, a.descripcion, a.tipo, a.fecha_programada, a.fecha_limite, 
-          a.duracion_minutos, a.nota_maxima, a.estado, a.recursos_url,
+$query = "SELECT a.id, a.titulo, a.descripcion, a.tipo, a.fecha_programada, a.fecha_limite,
+          TIME_TO_SEC(a.duracion_minutos)/60 as duracion_minutos, a.nota_maxima, a.estado, a.recursos_url,
           asig.nombre as asignatura_nombre,
           g.nombre as grado_nombre,
           s.nombre as seccion_nombre,
@@ -195,17 +268,21 @@ $query = "SELECT a.id, a.titulo, a.descripcion, a.tipo, a.fecha_programada, a.fe
           JOIN tbl_profesor prof ON ad.id_profesor = prof.id
           JOIN tbl_persona p ON prof.id_persona = p.id
           LEFT JOIN tbl_entrega_actividad ea ON a.id = ea.id_actividad
-          WHERE a.tipo = 'examen'";
+          WHERE a.tipo = 'examen' AND asig.id_institucion = :tid";
 
-$params = [];
+$params = [':tid' => $tid];
 
 // Si es profesor, filtrar por sus asignaciones
+// ✅ Corregido: mezclaba placeholders posicionales (?) en el SQL con claves
+// nombradas en el arreglo de parámetros — PDO no permite mezclar ambos.
 if ($rol == 'profesor' && !empty($asignaciones_profesor)) {
-    $placeholders = implode(',', array_fill(0, count($asignaciones_profesor), '?'));
-    $query .= " AND ad.id IN ($placeholders)";
+    $inKeys = [];
     foreach ($asignaciones_profesor as $key => $id_asig) {
-        $params[':asig_' . $key] = $id_asig;
+        $paramKey = ':asig_' . $key;
+        $inKeys[] = $paramKey;
+        $params[$paramKey] = $id_asig;
     }
+    $query .= " AND ad.id IN (" . implode(',', $inKeys) . ")";
 }
 
 if (!empty($filtro_estado)) {
@@ -243,21 +320,33 @@ $stmt->execute();
 $examenes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Obtener asignaturas para filtro
-$query = "SELECT id, nombre FROM tbl_asignatura ORDER BY nombre";
-$asignaturas = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+$query = "SELECT id, nombre FROM tbl_asignatura WHERE id_institucion = :tid ORDER BY nombre";
+$stmt = $db->prepare($query);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt->execute();
+$asignaturas = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Obtener asignaciones docentes para el formulario
 if ($rol == 'profesor' && !empty($asignaciones_profesor)) {
-    $placeholders = implode(',', array_fill(0, count($asignaciones_profesor), '?'));
+    $inKeys = [];
+    $params = [':tid' => $tid];
+    foreach ($asignaciones_profesor as $key => $id_asig) {
+        $paramKey = ':asig_' . $key;
+        $inKeys[] = $paramKey;
+        $params[$paramKey] = $id_asig;
+    }
     $query = "SELECT ad.id, asig.nombre as asignatura_nombre, g.nombre as grado_nombre, s.nombre as seccion_nombre
               FROM tbl_asignacion_docente ad
               JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
               JOIN tbl_seccion s ON ad.id_seccion = s.id
               JOIN tbl_grado g ON s.id_grado = g.id
-              WHERE ad.id IN ($placeholders)
+              WHERE ad.id IN (" . implode(',', $inKeys) . ") AND asig.id_institucion = :tid
               ORDER BY asig.nombre, g.nombre, s.nombre";
     $stmt = $db->prepare($query);
-    $stmt->execute($asignaciones_profesor);
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value);
+    }
+    $stmt->execute();
     $asignaciones_docentes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 } else {
     $query = "SELECT ad.id, asig.nombre as asignatura_nombre, g.nombre as grado_nombre, s.nombre as seccion_nombre
@@ -265,8 +354,12 @@ if ($rol == 'profesor' && !empty($asignaciones_profesor)) {
               JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
               JOIN tbl_seccion s ON ad.id_seccion = s.id
               JOIN tbl_grado g ON s.id_grado = g.id
+              WHERE asig.id_institucion = :tid
               ORDER BY asig.nombre, g.nombre, s.nombre";
-    $asignaciones_docentes = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+    $stmt = $db->prepare($query);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
+    $stmt->execute();
+    $asignaciones_docentes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
 
 // Estados de examen
@@ -325,11 +418,17 @@ $estados_examen = [
         <div class="d-flex justify-content-between align-items-center mb-4">
             <div>
                 <h2><i class="fas fa-file-alt text-danger"></i> Gestión de Exámenes</h2>
+                <?php if ($rol === 'profesor'): ?>
                 <p class="text-muted mb-0">Crear y administrar exámenes en línea</p>
+                <?php else: ?>
+                <p class="text-muted mb-0">Vista de supervisión — sólo el profesor de cada clase puede crear, editar o eliminar sus exámenes</p>
+                <?php endif; ?>
             </div>
+            <?php if ($rol === 'profesor'): ?>
             <button class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#modalExamen">
                 <i class="fas fa-plus"></i> Nuevo Examen
             </button>
+            <?php endif; ?>
         </div>
 
         <!-- Messages -->
@@ -433,10 +532,11 @@ $estados_examen = [
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($examenes)): ?>
-                            <tr><td colspan="8" class="text-center py-5 text-muted"><i class="fas fa-inbox fa-3x mb-3 d-block"></i>No hay exámenes registrados</td></tr>
-                            <?php else: ?>
-                            <?php foreach ($examenes as $examen): 
+                            <?php // Sin fila manual de "sin datos": con DataTables, una tbody con una
+                            // sola fila de 1 <td colspan> frente a un thead de más columnas dispara
+                            // "Incorrect column count" (tn/18). Con tbody vacío, DataTables muestra
+                            // su propio mensaje localizado (idioma es-ES cargado abajo). ?>
+                            <?php foreach ($examenes as $examen):
                                 $estado = $estados_examen[$examen['estado']] ?? ['label' => $examen['estado'], 'class' => 'bg-secondary', 'icon' => 'fa-circle'];
                             ?>
                             <tr>
@@ -471,14 +571,17 @@ $estados_examen = [
                                 <td>
                                     <div class="btn-group btn-group-sm">
                                         <button class="btn btn-info" onclick="verExamen(<?= $examen['id'] ?>)"><i class="fas fa-eye"></i></button>
+                                        <?php if ($rol === 'profesor'): ?>
                                         <button class="btn btn-warning" onclick="editarExamen(<?= $examen['id'] ?>)"><i class="fas fa-edit"></i></button>
+                                        <?php endif; ?>
                                         <button class="btn btn-success" onclick="verResultados(<?= $examen['id'] ?>)"><i class="fas fa-chart-bar"></i></button>
+                                        <?php if ($rol === 'profesor'): ?>
                                         <button class="btn btn-danger" onclick="eliminarExamen(<?= $examen['id'] ?>)"><i class="fas fa-trash"></i></button>
+                                        <?php endif; ?>
                                     </div>
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>

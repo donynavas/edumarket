@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'estudiante') {
     header("Location: " . BASE_URL . "/login.php");
@@ -10,45 +11,72 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 $examen_id = $_GET['id'] ?? 0;
 if (!$examen_id) die("Examen no válido");
 
-// Obtener datos del examen
-$stmt = $db->prepare("SELECT e.*, a.nombre as asignatura 
+// Obtener datos del examen. tbl_examen no tiene columna id_institucion;
+// el aislamiento por tenant se hace vía tbl_asignatura (ya joined).
+$stmt = $db->prepare("SELECT e.*, a.nombre as asignatura
                       FROM tbl_examen e
                       JOIN tbl_asignacion_docente ad ON e.id_asignacion_docente = ad.id
                       JOIN tbl_asignatura a ON ad.id_asignatura = a.id
-                      WHERE e.id = :id AND e.estado = 'activo'");
-$stmt->execute([':id' => $examen_id]);
+                      WHERE e.id = :id AND e.estado = 'activo' AND a.id_institucion = :tid");
+$stmt->execute([':id' => $examen_id, ':tid' => $tid]);
 $examen = $stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$examen) die("Examen no disponible");
 
+// duracion_minutos es nullable en tbl_examen (algunos exámenes viejos se
+// crearon sin ese campo). Se interpola tal cual dentro de una etiqueta de
+// script más abajo, en la línea "const duracion = [valor] * 60;" -- si
+// llega NULL, PHP lo imprime como cadena vacía y el JS queda
+// "const duracion = * 60;", un error de sintaxis que rompe TODO el bloque
+// de script completo: ninguna función (confirmarEntrega, entregarExamen,
+// startExam, etc.) llega a definirse, por eso el botón "Entregar Examen"
+// no hacía nada y el timer se quedaba en "--:--". Se normaliza aquí, una
+// sola vez, a un entero con respaldo de 60 minutos.
+// NOTA: evitar escribir el caracter "cierre de PHP" dentro de este
+// comentario -- PHP lo trata como fin de bloque de código incluso dentro
+// de un comentario de una línea, y convierte todo el resto del archivo en
+// texto plano (sin que php -l lo detecte como error).
+$duracion_minutos = (int) ($examen['duracion_minutos'] ?? 60);
+if ($duracion_minutos <= 0) $duracion_minutos = 60;
+
 // Verificar si el estudiante ya tiene un intento en progreso
-$stmt = $db->prepare("SELECT id, fecha_inicio, tiempo_usado FROM tbl_intento_examen 
-                      WHERE id_examen = :examen AND id_estudiante = (SELECT id FROM tbl_estudiante WHERE id_persona = (SELECT id_persona FROM tbl_usuario WHERE id = :user))
+$stmt = $db->prepare("SELECT id, fecha_inicio, tiempo_usado FROM tbl_intento_examen
+                      WHERE id_examen = :examen AND id_estudiante = (
+                          SELECT est.id FROM tbl_estudiante est
+                          JOIN tbl_persona per ON est.id_persona = per.id
+                          WHERE per.id_usuario = :user AND est.id_institucion = :tid1
+                      )
                       AND estado = 'en_progreso'
                       ORDER BY fecha_inicio DESC LIMIT 1");
-$stmt->execute([':examen' => $examen_id, ':user' => $user_id]);
+$stmt->execute([':examen' => $examen_id, ':user' => $user_id, ':tid1' => $tid]);
 $intento = $stmt->fetch(PDO::FETCH_ASSOC);
 
 // Si no hay intento, crear uno nuevo
 if (!$intento) {
     // Obtener id_matricula y id_estudiante
-    $stmt = $db->prepare("SELECT e.id as id_estudiante, m.id as id_matricula 
+    // tbl_asignacion_docente no tiene columna id_institucion; :asig ya está
+    // tenant-verificado (viene del examen, filtrado arriba por a.id_institucion).
+    $stmt = $db->prepare("SELECT e.id as id_estudiante, m.id as id_matricula
                           FROM tbl_estudiante e
                           JOIN tbl_persona p ON e.id_persona = p.id
                           JOIN tbl_matricula m ON e.id = m.id_estudiante
                           JOIN tbl_seccion s ON m.id_seccion = s.id
-                          WHERE p.id_usuario = :user AND m.estado = 'activo' AND s.id = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :asig)");
-    $stmt->execute([':user' => $user_id, ':asig' => $examen['id_asignacion_docente']]);
+                          WHERE p.id_usuario = :user AND e.id_institucion = :tid1 AND m.estado = 'activo'
+                          AND s.id = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :asig)");
+    $stmt->execute([':user' => $user_id, ':tid1' => $tid, ':asig' => $examen['id_asignacion_docente']]);
     $matricula = $stmt->fetch(PDO::FETCH_ASSOC);
-    
+
     if (!$matricula) die("No tienes matrícula activa para esta clase");
-    
-    // Crear nuevo intento
-    $stmt = $db->prepare("INSERT INTO tbl_intento_examen (id_examen, id_estudiante, id_matricula, fecha_inicio, estado) 
+
+    // Crear nuevo intento. tbl_intento_examen no tiene columna id_institucion
+    // (se confirmó contra el esquema real) — insertarla aquí bloqueaba TODO
+    // intento de examen para cualquier estudiante, siempre.
+    $stmt = $db->prepare("INSERT INTO tbl_intento_examen (id_examen, id_estudiante, id_matricula, fecha_inicio, estado)
                           VALUES (:examen, :estudiante, :matricula, NOW(), 'en_progreso')");
     $stmt->execute([
         ':examen' => $examen_id,
@@ -56,14 +84,20 @@ if (!$intento) {
         ':matricula' => $matricula['id_matricula']
     ]);
     $intento_id = $db->lastInsertId();
-    
+
     $intento = ['id' => $intento_id, 'fecha_inicio' => date('Y-m-d H:i:s'), 'tiempo_usado' => 0];
 } else {
     $intento_id = $intento['id'];
 }
 
-// Obtener preguntas del examen
-$order = $examen['mezclar_preguntas'] ? 'RAND()' : 'numero_orden';
+// Obtener preguntas del examen.
+// $intento_id ya es un entero validado (viene de $db->lastInsertId() o de
+// la fila de tbl_intento_examen recién leída) — se usa como semilla de
+// RAND() para que el orden sea estable durante TODO el intento (antes,
+// ORDER BY RAND() sin semilla reordenaba las preguntas en cada recarga de
+// la misma sesión de examen) pero distinto entre intentos/estudiantes.
+$intento_id_int = (int) $intento_id;
+$order = $examen['mezclar_preguntas'] ? "RAND($intento_id_int)" : 'numero_orden';
 $stmt = $db->prepare("SELECT p.*, GROUP_CONCAT(CONCAT(o.id,':',o.texto,':',o.es_correcta) SEPARATOR '|') as opciones_data
                       FROM tbl_pregunta_examen p
                       LEFT JOIN tbl_opcion_respuesta o ON p.id = o.id_pregunta
@@ -72,6 +106,26 @@ $stmt = $db->prepare("SELECT p.*, GROUP_CONCAT(CONCAT(o.id,':',o.texto,':',o.es_
                       ORDER BY $order");
 $stmt->execute([':examen' => $examen_id]);
 $preguntas = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+/**
+ * Barajado con semilla propia, estable por (intento, pregunta) — a
+ * diferencia de shuffle(), que usa y altera el generador aleatorio global
+ * de PHP y produce un orden distinto cada vez que se llama. Un simple LCG
+ * (generador congruencial lineal) alcanza para esto: no necesita ser
+ * criptográficamente fuerte, sólo determinista dada la semilla.
+ */
+function shuffleConSemilla(array $items, int $semilla): array {
+    $rng = $semilla;
+    $siguiente = function () use (&$rng) {
+        $rng = ($rng * 1103515245 + 12345) & 0x7fffffff;
+        return $rng;
+    };
+    for ($i = count($items) - 1; $i > 0; $i--) {
+        $j = $siguiente() % ($i + 1);
+        [$items[$i], $items[$j]] = [$items[$j], $items[$i]];
+    }
+    return $items;
+}
 
 // Parsear opciones
 foreach ($preguntas as &$preg) {
@@ -82,7 +136,11 @@ foreach ($preguntas as &$preg) {
             list($id, $texto, $correcta) = explode(':', $opt);
             $preg['opciones'][] = ['id' => $id, 'texto' => $texto, 'correcta' => $correcta];
         }
-        if ($examen['mezclar_opciones']) shuffle($preg['opciones']);
+        if ($examen['mezclar_opciones']) {
+            // Semilla distinta por pregunta (además del intento) para que
+            // no todas las preguntas queden con el mismo patrón de orden.
+            $preg['opciones'] = shuffleConSemilla($preg['opciones'], $intento_id_int * 31 + (int) $preg['id']);
+        }
     }
 }
 unset($preg);
@@ -146,7 +204,7 @@ unset($preg);
                     <div class="p-3 bg-light rounded mb-3"><?= nl2br(htmlspecialchars($examen['instrucciones'])) ?></div>
                     <?php endif; ?>
                     <ul class="list-unstyled">
-                        <li class="mb-2"><i class="fas fa-clock text-primary me-2"></i> <strong>Duración:</strong> <?= $examen['duracion_minutos'] ?> minutos</li>
+                        <li class="mb-2"><i class="fas fa-clock text-primary me-2"></i> <strong>Duración:</strong> <?= $duracion_minutos ?> minutos</li>
                         <li class="mb-2"><i class="fas fa-list-ol text-primary me-2"></i> <strong>Preguntas:</strong> <?= count($preguntas) ?></li>
                         <li class="mb-2"><i class="fas fa-star text-primary me-2"></i> <strong>Puntaje total:</strong> <?= array_sum(array_column($preguntas, 'puntaje')) ?> puntos</li>
                         <li class="mb-2"><i class="fas fa-exclamation-triangle text-warning me-2"></i> <strong>Intentos:</strong> <?= $examen['intento_maximo'] ?> máximo</li>
@@ -276,8 +334,8 @@ unset($preg);
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         // Timer
-        const duracion = <?= $examen['duracion_minutos'] ?> * 60;
-        let tiempoRestante = duracion - (<?= $intento['tiempo_usado'] ?> || 0);
+        const duracion = <?= $duracion_minutos ?> * 60;
+        let tiempoRestante = duracion - (<?= (int) ($intento['tiempo_usado'] ?? 0) ?> || 0);
         let timerInterval;
         
         function updateTimer() {
@@ -348,7 +406,7 @@ unset($preg);
             
             const formData = new FormData(document.getElementById('formExamen'));
             formData.append('intento_id', <?= $intento_id ?>);
-            formData.append('tiempo_usado', <?= $examen['duracion_minutos'] ?> * 60 - tiempoRestante);
+            formData.append('tiempo_usado', <?= $duracion_minutos ?> * 60 - tiempoRestante);
             
             fetch('api/entregar_examen.php', {
                 method: 'POST',

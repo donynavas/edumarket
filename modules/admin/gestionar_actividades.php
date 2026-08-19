@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
@@ -11,13 +12,15 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener ID del profesor
 $query = "SELECT p.id as id_profesor FROM tbl_profesor p
           JOIN tbl_persona per ON p.id_persona = per.id
-          WHERE per.id_usuario = :user_id";
+          WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $profesor = $stmt->fetch(PDO::FETCH_ASSOC);
 $id_profesor = $profesor['id_profesor'] ?? 0;
@@ -39,11 +42,12 @@ $query = "SELECT ad.id, asig.nombre as asignatura, g.nombre as grado, s.nombre a
           FROM tbl_asignacion_docente ad
           JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
           JOIN tbl_seccion s ON ad.id_seccion = s.id
-          WHERE ad.id = :id_asignacion AND ad.id_profesor = :id_profesor";
+          WHERE ad.id = :id_asignacion AND ad.id_profesor = :id_profesor AND asig.id_institucion = :tid";
 $stmt = $db->prepare($query);
 $stmt->execute([
     ':id_asignacion' => $id_asignacion,
-    ':id_profesor' => $id_profesor
+    ':id_profesor' => $id_profesor,
+    ':tid' => $tid
 ]);
 $asignacion = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -56,13 +60,20 @@ if (!$asignacion) {
 // Datos de la actividad (si es edición)
 $actividad = null;
 if ($modo_edicion) {
-    $query = "SELECT * FROM tbl_actividad WHERE id = :id AND id_asignacion_docente = :id_asignacion";
+    // tbl_actividad no tiene columna id_institucion; id_asignacion ya se
+    // verificó como propio del profesor arriba.
+    // duracion_minutos es TIME en el esquema real; se convierte de vuelta a
+    // minutos (entero) para que el formulario lo muestre correctamente.
+    $query = "SELECT *, TIME_TO_SEC(duracion_minutos)/60 as duracion_minutos_num FROM tbl_actividad WHERE id = :id AND id_asignacion_docente = :id_asignacion";
     $stmt = $db->prepare($query);
     $stmt->execute([
         ':id' => $id_actividad,
         ':id_asignacion' => $id_asignacion
     ]);
     $actividad = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($actividad) {
+        $actividad['duracion_minutos'] = $actividad['duracion_minutos_num'];
+    }
     
     if (!$actividad) {
         $_SESSION['error'] = "Actividad no encontrada";

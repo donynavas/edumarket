@@ -17,24 +17,27 @@ if (!$id_estudiante) {
     exit;
 }
 
+require_once __DIR__ . '/../../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 
 try {
     // Obtener datos completos del estudiante
-    $query = "SELECT 
+    $query = "SELECT
               e.id as id_estudiante, e.nie, e.estado_familiar, e.discapacidad, e.trabaja,
               p.primer_nombre, p.segundo_nombre, p.tercer_nombre, p.primer_apellido, p.segundo_apellido,
-              p.dui, p.fecha_nacimiento, p.sexo, p.nacionalidad, p.direccion, 
+              p.dui, p.fecha_nacimiento, p.sexo, p.nacionalidad, p.direccion,
               p.telefono_fijo, p.celular, p.email, p.id_usuario,
               u.usuario, u.estado as estado_usuario
               FROM tbl_estudiante e
               JOIN tbl_persona p ON e.id_persona = p.id
               LEFT JOIN tbl_usuario u ON p.id_usuario = u.id
-              WHERE e.id = :id_estudiante";
-    
+              WHERE e.id = :id_estudiante AND e.id_institucion = :tid";
+
     $stmt = $db->prepare($query);
     $stmt->bindValue(':id_estudiante', $id_estudiante, PDO::PARAM_INT);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     
     $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);

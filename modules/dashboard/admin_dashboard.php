@@ -3,69 +3,81 @@ session_start();
 require_once __DIR__ . '/../../config/database.php';
 require_once __DIR__ . '/../../config/app.php';
 
-// Verificar que sea admin
-if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'admin') {
+// Verificar que sea admin o director (login.php e index.php envían a
+// ambos roles aquí; el resto del módulo admin/ ya acepta los dos, pero a
+// este dashboard le faltaba — causaba un bucle de redirección infinito
+// para cualquier usuario con rol 'director').
+if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['rol'] != 'director')) {
     header("Location: " . BASE_URL . "/login.php");
     exit;
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 
-// Obtener estadísticas generales
+// Obtener estadísticas generales — SIEMPRE acotadas a la institución de la
+// sesión actual. Sin este filtro el dashboard mezclaba conteos de TODAS las
+// instituciones de la plataforma.
 $stats = [];
 
 // Total estudiantes
-$query = "SELECT COUNT(*) as total FROM tbl_estudiante e 
-          JOIN tbl_persona p ON e.id_persona = p.id 
-          JOIN tbl_usuario u ON p.id_usuario = u.id WHERE u.estado = 1";
+$query = "SELECT COUNT(*) as total FROM tbl_estudiante e
+          JOIN tbl_persona p ON e.id_persona = p.id
+          JOIN tbl_usuario u ON p.id_usuario = u.id
+          WHERE u.estado = 1 AND e.id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute();
+$stmt->execute([':tid' => $tid]);
 $stats['estudiantes'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
 // Total profesores
-$query = "SELECT COUNT(*) as total FROM tbl_profesor p 
-          JOIN tbl_persona per ON p.id_persona = per.id 
-          JOIN tbl_usuario u ON per.id_usuario = u.id WHERE u.estado = 1";
+$query = "SELECT COUNT(*) as total FROM tbl_profesor p
+          JOIN tbl_persona per ON p.id_persona = per.id
+          JOIN tbl_usuario u ON per.id_usuario = u.id
+          WHERE u.estado = 1 AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute();
+$stmt->execute([':tid' => $tid]);
 $stats['profesores'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
 // Total asignaturas
-$query = "SELECT COUNT(*) as total FROM tbl_asignatura";
+$query = "SELECT COUNT(*) as total FROM tbl_asignatura WHERE id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute();
+$stmt->execute([':tid' => $tid]);
 $stats['asignaturas'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
 // Total grados
-$query = "SELECT COUNT(*) as total FROM tbl_grado";
+$query = "SELECT COUNT(*) as total FROM tbl_grado WHERE id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute();
+$stmt->execute([':tid' => $tid]);
 $stats['grados'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
 // Usuarios activos
-$query = "SELECT COUNT(*) as total FROM tbl_usuario WHERE estado = 1";
+$query = "SELECT COUNT(*) as total FROM tbl_usuario WHERE estado = 1 AND id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute();
+$stmt->execute([':tid' => $tid]);
 $stats['usuarios_activos'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-// Notificaciones pendientes
-$query = "SELECT COUNT(*) as total FROM tbl_notificacion 
+// Notificaciones pendientes (ya son propias del usuario, sin cambio)
+$query = "SELECT COUNT(*) as total FROM tbl_notificacion
           WHERE id_destinatario = :user_id AND leido = 0";
 $stmt = $db->prepare($query);
 $stmt->bindParam(':user_id', $user_id);
 $stmt->execute();
 $stats['notificaciones'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-// Actividad reciente
-$query = "SELECT l.*, u.usuario, p.primer_nombre, p.primer_apellido 
+// Actividad reciente — sólo de usuarios de la propia institución
+// tbl_logs_actividad no tiene columna id_institucion; se acota por
+// institución vía tbl_usuario (u.id_institucion), que ya está joined.
+$query = "SELECT l.*, u.usuario, p.primer_nombre, p.primer_apellido
           FROM tbl_logs_actividad l
           JOIN tbl_usuario u ON l.id_usuario = u.id
           JOIN tbl_persona p ON u.id = p.id_usuario
+          WHERE u.id_institucion = :tid
           ORDER BY l.fecha_hora DESC LIMIT 10";
 $stmt = $db->prepare($query);
-$stmt->execute();
+$stmt->execute([':tid' => $tid]);
 $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
 ?>
 
@@ -193,6 +205,12 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
             transform: translateY(-3px);
             box-shadow: 0 5px 15px rgba(0,0,0,0.15);
         }
+
+        .quick-action.disabled {
+            opacity: 0.5;
+            pointer-events: none;
+            cursor: default;
+        }
         
         .quick-action i {
             font-size: 2rem;
@@ -250,91 +268,95 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
         </div>
         
         <nav class="nav flex-column">
-            <a class="nav-link active" href="admin_dashboard.php">
+            <a class="nav-link active" href="<?= BASE_URL ?>/modules/dashboard/admin_dashboard.php">
                 <i class="fas fa-tachometer-alt"></i> Dashboard
             </a>
-            
+
             <div class="sidebar-section">
                 <small class="text-uppercase text-muted px-3">Gestión Académica</small>
-                <a class="nav-link" href="modules/admin/gestionar_estudiantes.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_estudiantes.php">
                     <i class="fas fa-user-graduate"></i> Estudiantes
                 </a>
-                <a class="nav-link" href="modules/admin/gestionar_profesores.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_profesores.php">
                     <i class="fas fa-chalkboard-teacher"></i> Profesores
                 </a>
-                <a class="nav-link" href="modules/admin/gestionar_grados.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_grados.php">
                     <i class="fas fa-layer-group"></i> Grados/Secciones
                 </a>
-                <a class="nav-link" href="modules/admin/gestionar_asignaturas.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_asignaturas.php">
                     <i class="fas fa-book"></i> Asignaturas
                 </a>
-                <a class="nav-link" href="modules/admin/gestionar_matriculas.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_matriculas.php">
                     <i class="fas fa-file-signature"></i> Matrículas
                 </a>
             </div>
-            
+
             <div class="sidebar-section">
                 <small class="text-uppercase text-muted px-3">Evaluaciones</small>
-                <a class="nav-link" href="modules/admin/gestionar_actividades.php">
-                    <i class="fas fa-tasks"></i> Actividades
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="La gestión de actividades es una función del panel de profesor; no hay vista de administrador todavía">
+                    <i class="fas fa-tasks"></i> Actividades <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="modules/admin/gestionar_examenes.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_examenes.php">
                     <i class="fas fa-file-alt"></i> Exámenes
                 </a>
-                <a class="nav-link" href="modules/admin/calificaciones.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/calificaciones.php">
                     <i class="fas fa-star"></i> Calificaciones
                 </a>
-                <a class="nav-link" href="modules/admin/calendario_evaluaciones.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/cuadro_notas.php">
+                    <i class="fas fa-clipboard-list"></i> Cuadro de Notas
+                </a>
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/calendario_evaluaciones.php">
                     <i class="fas fa-calendar-alt"></i> Calendario
                 </a>
             </div>
-            
+
             <div class="sidebar-section">
                 <small class="text-uppercase text-muted px-3">Comunicación</small>
-                <a class="nav-link" href="notificaciones.php">
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
                     <i class="fas fa-bell notification-badge"></i> Notificaciones
                     <?php if($stats['notificaciones'] > 0): ?>
                         <span class="badge bg-danger"><?= $stats['notificaciones'] ?></span>
                     <?php endif; ?>
+                    <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="foros.php">
-                    <i class="fas fa-comments"></i> Foros
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-comments"></i> Foros <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="mensajeria.php">
-                    <i class="fas fa-envelope"></i> Mensajería
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-envelope"></i> Mensajería <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
             </div>
-            
+
             <div class="sidebar-section">
                 <small class="text-uppercase text-muted px-3">Reportes</small>
-                <a class="nav-link" href="reporte_notas.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/reporte_notas.php">
                     <i class="fas fa-chart-bar"></i> Reporte de Notas
                 </a>
-                <a class="nav-link" href="reporte_asistencia.php">
-                    <i class="fas fa-clipboard-check"></i> Reporte de Asistencia
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-clipboard-check"></i> Reporte de Asistencia <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="reporte_uso.php">
-                    <i class="fas fa-chart-line"></i> Uso de Plataforma
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-chart-line"></i> Uso de Plataforma <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="reporte_general.php">
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/reporte_general.php">
                     <i class="fas fa-file-pdf"></i> Reporte General
                 </a>
             </div>
-            
+
             <div class="sidebar-section">
                 <small class="text-uppercase text-muted px-3">Sistema</small>
-                <a class="nav-link" href="gestionar_usuarios.php">
-                    <i class="fas fa-users-cog"></i> Usuarios
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-users-cog"></i> Usuarios <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="configuracion.php">
-                    <i class="fas fa-cog"></i> Configuración
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-cog"></i> Configuración <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
-                <a class="nav-link" href="logs_actividad.php">
-                    <i class="fas fa-history"></i> Logs de Actividad
+                <a class="nav-link disabled" href="#" tabindex="-1" aria-disabled="true" title="Próximamente">
+                    <i class="fas fa-history"></i> Logs de Actividad <span class="badge bg-secondary ms-1">Próx.</span>
                 </a>
             </div>
-            
-            <a class="nav-link mt-4" href="../logout.php">
+
+            <a class="nav-link mt-4" id="logoutLink" href="<?= BASE_URL ?>/logout.php">
                 <i class="fas fa-sign-out-alt"></i> Cerrar Sesión
             </a>
         </nav>
@@ -364,24 +386,24 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     </a>
                     <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="notifDropdown">
                         <li><h6 class="dropdown-header">Notificaciones</h6></li>
-                        <li><a class="dropdown-item" href="notificaciones.php">Ver todas</a></li>
+                        <li><span class="dropdown-item disabled">Ver todas (próximamente)</span></li>
                     </ul>
                 </div>
-                
+
                 <div class="dropdown">
-                    <a class="d-flex align-items-center text-decoration-none dropdown-toggle" 
+                    <a class="d-flex align-items-center text-decoration-none dropdown-toggle"
                        href="#" id="userDropdown" data-bs-toggle="dropdown">
-                        <div class="rounded-circle bg-primary text-white d-flex align-items-center 
+                        <div class="rounded-circle bg-primary text-white d-flex align-items-center
                                     justify-content-center me-2" style="width: 40px; height: 40px;">
                             <i class="fas fa-user"></i>
                         </div>
                         <span>Admin</span>
                     </a>
                     <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="userDropdown">
-                        <li><a class="dropdown-item" href="perfil.php"><i class="fas fa-user"></i> Perfil</a></li>
-                        <li><a class="dropdown-item" href="configuracion.php"><i class="fas fa-cog"></i> Configuración</a></li>
+                        <li><span class="dropdown-item disabled"><i class="fas fa-user"></i> Perfil (próximamente)</span></li>
+                        <li><span class="dropdown-item disabled"><i class="fas fa-cog"></i> Configuración (próximamente)</span></li>
                         <li><hr class="dropdown-divider"></li>
-                        <li><a class="dropdown-item" href="logout.php"><i class="fas fa-sign-out-alt"></i> Salir</a></li>
+                        <li><a class="dropdown-item" href="<?= BASE_URL ?>/logout.php"><i class="fas fa-sign-out-alt"></i> Salir</a></li>
                     </ul>
                 </div>
             </div>
@@ -429,42 +451,42 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
             </div>
             
             <div class="col-md-2 col-4 mb-3">
-                <a href="modules/admin/gestionar_estudiantes.php" class="quick-action">
+                <a href="<?= BASE_URL ?>/modules/admin/gestionar_estudiantes.php" class="quick-action">
                     <i class="fas fa-user-plus"></i>
                     <small>Nuevo Estudiante</small>
                 </a>
             </div>
-            
+
             <div class="col-md-2 col-4 mb-3">
-                <a href="modules/admin/gestionar_profesores.php" class="quick-action">
+                <a href="<?= BASE_URL ?>/modules/admin/gestionar_profesores.php" class="quick-action">
                     <i class="fas fa-user-plus"></i>
                     <small>Nuevo Profesor</small>
                 </a>
             </div>
-            
+
             <div class="col-md-2 col-4 mb-3">
-                <a href="modules/admin/gestionar_matriculas.php" class="quick-action">
+                <a href="<?= BASE_URL ?>/modules/admin/gestionar_matriculas.php" class="quick-action">
                     <i class="fas fa-file-signature"></i>
                     <small>Matricular</small>
                 </a>
             </div>
-            
+
             <div class="col-md-2 col-4 mb-3">
-                <a href="modules/admin/gestionar_actividades.php" class="quick-action">
+                <a href="#" class="quick-action disabled" tabindex="-1" aria-disabled="true" title="La gestión de actividades es una función del panel de profesor; no hay vista de administrador todavía">
                     <i class="fas fa-plus-circle"></i>
                     <small>Nueva Actividad</small>
                 </a>
             </div>
-            
+
             <div class="col-md-2 col-4 mb-3">
-                <a href="calendario_evaluaciones.php" class="quick-action">
+                <a href="<?= BASE_URL ?>/modules/admin/calendario_evaluaciones.php" class="quick-action">
                     <i class="fas fa-calendar-plus"></i>
                     <small>Calendario</small>
                 </a>
             </div>
-            
+
             <div class="col-md-2 col-4 mb-3">
-                <a href="modules/admin/reporte_general.php" class="quick-action">
+                <a href="<?= BASE_URL ?>/modules/admin/reporte_general.php" class="quick-action">
                     <i class="fas fa-file-pdf"></i>
                     <small>Reportes</small>
                 </a>
@@ -501,7 +523,7 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         </table>
                     </div>
                     <div class="p-3 text-center border-top">
-                        <a href="logs_actividad.php" class="btn btn-sm btn-outline-primary">Ver Todos los Logs</a>
+                        <a href="#" class="btn btn-sm btn-outline-primary disabled" tabindex="-1" aria-disabled="true" title="Próximamente">Ver Todos los Logs</a>
                     </div>
                 </div>
             </div>
@@ -545,7 +567,7 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
                         <hr>
                         
                         <div class="text-center">
-                            <a href="reporte_uso.php" class="btn btn-outline-primary btn-sm">
+                            <a href="#" class="btn btn-outline-primary btn-sm disabled" tabindex="-1" aria-disabled="true" title="Próximamente">
                                 <i class="fas fa-chart-line"></i> Ver Uso de Plataforma
                             </a>
                         </div>
@@ -579,39 +601,33 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 $('#sidebar').toggleClass('active');
             });
             
-            // Marcar nav link activo según URL
+            // Marcar nav link activo según URL (compara pathname contra pathname,
+            // no un substring de un href absoluto — con BASE_URL los hrefs ya son
+            // URLs completas, así que "includes()" sobre el pathname nunca calzaba).
             const currentPath = window.location.pathname;
             $('.sidebar .nav-link').each(function() {
                 const href = $(this).attr('href');
-                if (currentPath.includes(href)) {
-                    $(this).addClass('active');
-                }
-            });
-            
-            // Actualizar notificaciones cada 30 segundos
-            setInterval(function() {
-                $.ajax({
-                    url: 'api/get_notificaciones_count.php',
-                    method: 'GET',
-                    success: function(data) {
-                        if (data.count > 0) {
-                            $('.notification-badge .badge').text(data.count);
-                            $('.notification-badge .badge').show();
-                        } else {
-                            $('.notification-badge .badge').hide();
-                        }
+                if (!href || href === '#') return;
+                try {
+                    const linkPath = new URL(href, window.location.origin).pathname;
+                    if (linkPath === currentPath) {
+                        $(this).addClass('active');
                     }
-                });
-            }, 30000);
-            
+                } catch (e) { /* href inválido, ignorar */ }
+            });
+
+            // Nota: el conteo de notificaciones en vivo (api/get_notificaciones_count.php)
+            // todavía no está implementado — no hay endpoint que llamar, así que el
+            // polling se deja desactivado para no generar errores 404 cada 30s.
+
             // Tooltip initialization
             var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
             var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
                 return new bootstrap.Tooltip(tooltipTriggerEl)
             });
-            
+
             // Confirmar cierre de sesión
-            $('a[href="../logout.php"]').click(function(e) {
+            $('#logoutLink, .dropdown-item[href$="logout.php"]').click(function(e) {
                 if (!confirm('¿Está seguro de cerrar sesión?')) {
                     e.preventDefault();
                 }

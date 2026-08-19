@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id'])) {
@@ -8,8 +9,11 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
+$database = new Database();
+$db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 $rol = $_SESSION['rol'];
+$tid = TenantGuard::id();
 
 // Obtener IDs
 $id_video = $_GET['id_video'] ?? 0;
@@ -46,9 +50,10 @@ $id_estudiante = 0;
 if ($rol == 'estudiante') {
     $query = "SELECT e.id FROM tbl_estudiante e
               JOIN tbl_persona p ON e.id_persona = p.id
-              WHERE p.id_usuario = :user_id";
+              WHERE p.id_usuario = :user_id AND e.id_institucion = :tid";
     $stmt = $db->prepare($query);
     $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $estudiante_data = $stmt->fetch(PDO::FETCH_ASSOC);
     $id_estudiante = $estudiante_data['id'] ?? 0;
@@ -67,7 +72,7 @@ $ejercicios = $stmt->fetchAll(PDO::FETCH_ASSOC);
 $progreso_anterior = null;
 $respuestas_anteriores = [];
 if ($id_estudiante) {
-    $query = "SELECT * FROM tbl_ingles_progreso 
+    $query = "SELECT * FROM tbl_ingles_progreso
               WHERE id_estudiante = :id_estudiante AND id_leccion = :id_leccion";
     $stmt = $db->prepare($query);
     $stmt->bindValue(':id_estudiante', $id_estudiante, PDO::PARAM_INT);

@@ -34,7 +34,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $tenantId) {
                 SELECT u.id, u.usuario, u.password, u.rol, u.estado,
                        CONCAT(COALESCE(p.primer_nombre,''), ' ', COALESCE(p.primer_apellido,'')) AS nombre_completo
                 FROM tbl_usuario u
-                LEFT JOIN tbl_persona p ON u.id_persona = p.id
+                LEFT JOIN tbl_persona p ON p.id_usuario = u.id
                 WHERE u.usuario = :usuario
                   AND u.id_institucion = :id_inst
                   AND u.estado = 1

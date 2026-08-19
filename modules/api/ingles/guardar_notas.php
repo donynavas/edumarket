@@ -8,6 +8,7 @@
 session_start();
 header('Content-Type: application/json');
 require_once __DIR__ . '/../../../config/database.php';
+require_once __DIR__ . '/../../../config/TenantGuard.php';
 
 if (!isset($_SESSION['user_id'])) {
     echo json_encode([
@@ -17,11 +18,11 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
+$tid = TenantGuard::id();
 $id_video = $_POST['id_video'] ?? 0;
-$id_estudiante = $_POST['id_estudiante'] ?? 0;
 $notas = $_POST['notas'] ?? '';
 
-if (!$id_video || !$id_estudiante) {
+if (!$id_video) {
     echo json_encode([
         'success' => false,
         'message' => 'Parámetros incompletos'
@@ -32,7 +33,20 @@ if (!$id_video || !$id_estudiante) {
 try {
     $database = new Database();
     $db = $database->getConnection();
-    
+
+    // El id_estudiante SIEMPRE se deriva de la sesión, nunca del cliente.
+    $stmtEst = $db->prepare(
+        "SELECT e.id FROM tbl_estudiante e
+         JOIN tbl_persona p ON e.id_persona = p.id
+         WHERE p.id_usuario = :uid AND e.id_institucion = :tid"
+    );
+    $stmtEst->execute([':uid' => $_SESSION['user_id'], ':tid' => $tid]);
+    $id_estudiante = $stmtEst->fetchColumn();
+    if (!$id_estudiante) {
+        echo json_encode(['success' => false, 'message' => 'Estudiante no encontrado']);
+        exit;
+    }
+
     // Verificar si existe tabla de notas (crear si no existe)
     $query = "CREATE TABLE IF NOT EXISTS tbl_ingles_notas_estudiante (
               id INT AUTO_INCREMENT PRIMARY KEY,

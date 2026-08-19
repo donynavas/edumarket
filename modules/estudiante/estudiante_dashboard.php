@@ -3,6 +3,7 @@
 session_start();
 require_once __DIR__ . '/../../config/database.php';
 require_once __DIR__ . '/../../config/app.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -13,16 +14,17 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // ===== OBTENER DATOS DEL ESTUDIANTE =====
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante, e.nie, e.estado_familiar, e.discapacidad, e.trabaja,
           p.primer_nombre, p.segundo_nombre, p.primer_apellido, p.segundo_apellido,
-          p.dui, p.fecha_nacimiento, p.sexo, p.nacionalidad, p.direccion, 
+          p.dui, p.fecha_nacimiento, p.sexo, p.nacionalidad, p.direccion,
           p.telefono_fijo, p.celular, p.email,
           g.id as id_grado, g.nombre as grado_nombre, g.nivel, g.nota_minima_aprobacion,
           s.id as id_seccion, s.nombre as seccion_nombre,
-          m.id as id_matricula, m.anno, m.id_periodo, m.estado,
+          m.id as id_matricula, m.anno, m.estado,
           u.usuario
           FROM tbl_estudiante e
           JOIN tbl_persona p ON e.id_persona = p.id
@@ -32,11 +34,13 @@ $query = "SELECT
           LEFT JOIN tbl_grado g ON s.id_grado = g.id
           WHERE p.id_usuario = :user_id
           AND (m.estado = 'activo' OR m.estado IS NULL)
-          ORDER BY m.anno DESC, m.id_periodo DESC
+          AND e.id_institucion = :tid
+          ORDER BY m.anno DESC, m.id DESC
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -59,7 +63,7 @@ if (!$estudiante) {
                             <i class="fas fa-exclamation-triangle fa-4x text-warning mb-3"></i>
                             <h4>Sin Matrícula Activa</h4>
                             <p class="text-muted">Contacta a administración para regularizar tu situación.</p>
-                            <a href="logout.php" class="btn btn-secondary">Cerrar Sesión</a>
+                            <a href="<?= BASE_URL ?>/logout.php" class="btn btn-secondary">Cerrar Sesión</a>
                         </div>
                     </div>
                 </div>
@@ -76,22 +80,33 @@ $id_estudiante = $estudiante['id_estudiante'] ?? 0;
 $id_matricula = $estudiante['id_matricula'] ?? 0;
 $id_seccion = $estudiante['id_seccion'] ?? 0;
 $anno = $estudiante['anno'] ?? date('Y');
-$periodo = $estudiante['id_periodo'] ?? 1;
+// NOTA: ya no se filtra por "período" (id_periodo, un entero legado 1-4 sin
+// relación con tbl_periodo real) -- una asignación docente y una matrícula
+// duran el año lectivo completo, así que el estudiante debe ver TODAS sus
+// clases/actividades del año sin importar en qué "período" se haya creado
+// la asignación. Ese filtro era la causa de que exámenes/actividades ya
+// asignados no aparecieran (ver commit "Corregir regresión..." de hoy). El
+// concepto de período sigue existiendo, pero solo para el Cuadro de Notas
+// (modules/admin/cuadro_notas.php), que ya usa tbl_periodo real por fechas.
 
 // ===== ESTADÍSTICAS DEL ESTUDIANTE =====
 
 // 1. Promedio general
-$query_prom = "SELECT AVG(ea.nota_obtenida) as promedio, COUNT(ea.id) as total_calificadas
-               FROM tbl_entrega_actividad ea
-               JOIN tbl_actividad act ON ea.id_actividad = act.id
-               JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
-               WHERE ea.id_matricula = :id_matricula
-               AND ad.id_periodo = :periodo
-               AND ea.nota_obtenida IS NOT NULL";
+//
+// Igual que en mis_notas.php: las notas de examen viven en
+// tbl_intento_examen, no en tbl_entrega_actividad. vw_logro_estudiante
+// (migrations/2026_08_16_vista_logro_estudiante.sql) unifica ambas
+// fuentes -- sin ella, un estudiante que solo hubiera presentado
+// exámenes (sin tareas entregadas aún) seguía viendo "0.00" de Promedio
+// General aunque ya tuviera exámenes calificados.
+$query_prom = "SELECT AVG(nota_obtenida) as promedio, COUNT(*) as total_calificadas
+               FROM vw_logro_estudiante
+               WHERE id_matricula = :id_matricula
+               AND estado_entrega = 'calificado'
+               AND nota_obtenida IS NOT NULL";
 $stmt_prom = $db->prepare($query_prom);
 $stmt_prom->execute([
-    ':id_matricula' => $id_matricula,
-    ':periodo' => $periodo
+    ':id_matricula' => $id_matricula
 ]);
 $stats_promedio = $stmt_prom->fetch(PDO::FETCH_ASSOC);
 $promedio_general = $stats_promedio['promedio'] ?? 0;
@@ -103,7 +118,6 @@ $query_pendientes = "SELECT COUNT(*) as pendientes
                      LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad 
                          AND ea.id_matricula = :id_matricula
                      WHERE ad.id_seccion = :id_seccion
-                     AND ad.id_periodo = :periodo
                      AND ad.anno = :anno
                      AND act.tipo IN ('tarea', 'laboratorio', 'proyecto')
                      AND act.fecha_limite >= NOW()
@@ -112,7 +126,6 @@ $stmt_pendientes = $db->prepare($query_pendientes);
 $stmt_pendientes->execute([
     ':id_matricula' => $id_matricula,
     ':id_seccion' => $id_seccion,
-    ':periodo' => $periodo,
     ':anno' => $anno
 ]);
 $tareas_pendientes = $stmt_pendientes->fetchColumn();
@@ -126,7 +139,6 @@ $query_examenes = "SELECT
     JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
     JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
     WHERE ad.id_seccion = :id_seccion
-    AND ad.id_periodo = :periodo
     AND ad.anno = :anno
     AND act.tipo = 'examen'
     AND act.estado = 'activo'
@@ -137,7 +149,6 @@ $query_examenes = "SELECT
 $stmt_examenes = $db->prepare($query_examenes);
 $stmt_examenes->execute([
     ':id_seccion' => $id_seccion,
-    ':periodo' => $periodo,
     ':anno' => $anno
 ]);
 $proximos_examenes = $stmt_examenes->fetchAll(PDO::FETCH_ASSOC);
@@ -180,7 +191,6 @@ $query_clases = "SELECT
         AND ea.id_matricula = :id_matricula
     WHERE ad.id_seccion = :id_seccion
     AND ad.anno = :anno
-    AND ad.id_periodo = :periodo
     GROUP BY ad.id
     ORDER BY asig.nombre";
 
@@ -188,7 +198,6 @@ $stmt_clases = $db->prepare($query_clases);
 $stmt_clases->execute([
     ':id_seccion' => $id_seccion,
     ':anno' => $anno,
-    ':periodo' => $periodo,
     ':id_matricula' => $id_matricula
 ]);
 $clases = $stmt_clases->fetchAll(PDO::FETCH_ASSOC);
@@ -205,7 +214,6 @@ $query_actividades = "SELECT
     LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad 
         AND ea.id_matricula = :id_matricula
     WHERE ad.id_seccion = :id_seccion
-    AND ad.id_periodo = :periodo
     AND ad.anno = :anno
     AND act.fecha_limite >= CURDATE()
     AND (ea.id IS NULL OR ea.estado_entrega != 'calificado')
@@ -215,7 +223,6 @@ $query_actividades = "SELECT
 $stmt_actividades = $db->prepare($query_actividades);
 $stmt_actividades->execute([
     ':id_seccion' => $id_seccion,
-    ':periodo' => $periodo,
     ':anno' => $anno,
     ':id_matricula' => $id_matricula
 ]);
@@ -243,7 +250,6 @@ $stmt_notas->execute([':id_matricula' => $id_matricula]);
 $ultimas_notas = $stmt_notas->fetchAll(PDO::FETCH_ASSOC);
 
 // ===== CONFIGURACIÓN =====
-$periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4 => '4to Trimestre'];
 $tipos_actividad = [
     'tarea' => ['label' => 'Tarea', 'icon' => 'fa-clipboard', 'color' => 'info'],
     'examen' => ['label' => 'Examen', 'icon' => 'fa-file-alt', 'color' => 'danger'],
@@ -292,11 +298,11 @@ $nombre_completo = trim("{$estudiante['primer_nombre']} {$estudiante['segundo_no
             <small class="text-white-50"><?= htmlspecialchars($estudiante['grado_nombre']) ?> - <?= htmlspecialchars($estudiante['seccion_nombre']) ?></small>
         </div>
         <nav class="nav flex-column p-2">
-            <a class="nav-link active" href="index.php"><i class="fas fa-home"></i> Dashboard</a>
-            <a class="nav-link" href="modules/estudiante/mis_clases.php"><i class="fas fa-book"></i> Mis Clases</a>
-            <a class="nav-link" href="modules/estudiante/actividades.php"><i class="fas fa-tasks"></i> Actividades</a>
-            <a class="nav-link" href="modules/estudiante/mis_notas.php"><i class="fas fa-star"></i> Calificaciones</a>
-            <a class="nav-link" href="logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
+            <a class="nav-link active" href="<?= BASE_URL ?>/modules/estudiante/estudiante_dashboard.php"><i class="fas fa-home"></i> Dashboard</a>
+            <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/mis_clases.php"><i class="fas fa-book"></i> Mis Clases</a>
+            <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/actividades.php"><i class="fas fa-tasks"></i> Actividades</a>
+            <a class="nav-link" href="<?= BASE_URL ?>/modules/estudiante/mis_notas.php"><i class="fas fa-star"></i> Calificaciones</a>
+            <a class="nav-link" href="<?= BASE_URL ?>/logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </aside>
 

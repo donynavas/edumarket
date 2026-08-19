@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea profesor
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
@@ -11,14 +12,16 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del profesor
 $query = "SELECT p.id as id_profesor, per.primer_nombre, per.primer_apellido, per.email
           FROM tbl_profesor p
           JOIN tbl_persona per ON p.id_persona = per.id
-          WHERE per.id_usuario = :user_id";
+          WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $profesor = $stmt->fetch(PDO::FETCH_ASSOC);
 $id_profesor = $profesor['id_profesor'] ?? 0;
@@ -27,24 +30,39 @@ $mensaje = '';
 $tipo_mensaje = '';
 
 // ===== OBTENER ASIGNACIONES DEL PROFESOR =====
+// Se incluye nota_minima_aprobacion/nivel de tbl_grado (catálogo global) para
+// usar el umbral de aprobación REAL de cada grado en vez del "7" fijo que
+// se usaba antes (con un comentario que admitía "asumiendo 7 como base").
 $query = "SELECT ad.id, ad.anno, asig.nombre as asignatura_nombre, asig.codigo as asignatura_codigo,
           g.nombre as grado_nombre, s.nombre as seccion_nombre,
+          g.nivel as grado_nivel, g.nota_minima_aprobacion,
           COUNT(DISTINCT m.id) as total_estudiantes
           FROM tbl_asignacion_docente ad
           JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
           JOIN tbl_seccion s ON ad.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
           LEFT JOIN tbl_matricula m ON s.id = m.id_seccion AND m.anno = ad.anno AND m.estado = 'activo'
-          WHERE ad.id_profesor = :id_profesor
+          WHERE ad.id_profesor = :id_profesor AND asig.id_institucion = :tid
           GROUP BY ad.id
           ORDER BY g.nombre, s.nombre, asig.nombre";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':id_profesor', $id_profesor, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $asignaciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // ===== FILTROS =====
 $id_asignacion_filtro = $_GET['asignacion'] ?? ($asignaciones[0]['id'] ?? 0);
+
+$asignacion_actual_rep = null;
+foreach ($asignaciones as $asig) {
+    if ($asig['id'] == $id_asignacion_filtro) { $asignacion_actual_rep = $asig; break; }
+}
+// 6.0 es el valor por defecto real de tbl_grado.nota_minima_aprobacion, no
+// el 7 que asumía el código anterior.
+$nota_minima_aprobacion = $asignacion_actual_rep['nota_minima_aprobacion'] ?? 6.0;
+$niveles_label_rep = ['basica' => 'Educación Básica', 'bachillerato' => 'Bachillerato'];
+$nivel_actual_label_rep = $niveles_label_rep[$asignacion_actual_rep['grado_nivel'] ?? ''] ?? '';
 
 // ===== INICIALIZAR VARIABLES DE ESTADÍSTICAS =====
 $stats = [
@@ -68,11 +86,11 @@ if ($id_asignacion_filtro) {
                        FROM tbl_asignacion_docente ad
                        LEFT JOIN tbl_matricula m ON m.id_seccion = ad.id_seccion AND m.anno = ad.anno AND m.estado = 'activo'
                        LEFT JOIN tbl_actividad a ON a.id_asignacion_docente = ad.id AND a.estado IN ('publicado', 'activo', 'cerrado')
-                       WHERE ad.id = :id_asignacion
+                       WHERE ad.id = :id_asignacion AND ad.id_profesor = :id_profesor
                        GROUP BY ad.id";
-        
+
         $stmt_info = $db->prepare($query_info);
-        $stmt_info->execute([':id_asignacion' => $id_asignacion_filtro]);
+        $stmt_info->execute([':id_asignacion' => $id_asignacion_filtro, ':id_profesor' => $id_profesor]);
         $info = $stmt_info->fetch(PDO::FETCH_ASSOC);
         
         if ($info) {
@@ -84,10 +102,11 @@ if ($id_asignacion_filtro) {
         $query_grades = "SELECT ea.nota_obtenida, ea.estado_entrega
                          FROM tbl_entrega_actividad ea
                          JOIN tbl_actividad a ON ea.id_actividad = a.id
-                         WHERE a.id_asignacion_docente = :id_asignacion";
-        
+                         JOIN tbl_asignacion_docente ad ON a.id_asignacion_docente = ad.id
+                         WHERE a.id_asignacion_docente = :id_asignacion AND ad.id_profesor = :id_profesor";
+
         $stmt_grades = $db->prepare($query_grades);
-        $stmt_grades->execute([':id_asignacion' => $id_asignacion_filtro]);
+        $stmt_grades->execute([':id_asignacion' => $id_asignacion_filtro, ':id_profesor' => $id_profesor]);
         $all_grades = $stmt_grades->fetchAll(PDO::FETCH_ASSOC);
 
         // Procesar datos en PHP (Más rápido y flexible que SQL complejo)
@@ -103,7 +122,7 @@ if ($id_asignacion_filtro) {
                 $suma_notas += $nota;
                 $count_notas++;
                 
-                if ($nota >= 7) $aprobados++; // Asumiendo 7 como aprobación base
+                if ($nota >= $nota_minima_aprobacion) $aprobados++;
 
                 if ($nota <= 4) $datos_distribucion['0-4']++;
                 elseif ($nota <= 6) $datos_distribucion['5-6']++;
@@ -141,19 +160,21 @@ if ($id_asignacion_filtro) {
                             FROM tbl_estudiante e
                             JOIN tbl_persona p ON e.id_persona = p.id
                             JOIN tbl_matricula m ON e.id = m.id_estudiante
-                            LEFT JOIN tbl_entrega_actividad ea ON e.id = ea.id_estudiante
+                            LEFT JOIN tbl_entrega_actividad ea ON m.id = ea.id_matricula
                             LEFT JOIN tbl_actividad a ON ea.id_actividad = a.id AND a.id_asignacion_docente = :id_asignacion
-                            WHERE m.id_seccion = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :id_asig)
-                            AND m.anno = (SELECT anno FROM tbl_asignacion_docente WHERE id = :id_asig2)
+                            WHERE m.id_seccion = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :id_asig AND id_profesor = :id_prof)
+                            AND m.anno = (SELECT anno FROM tbl_asignacion_docente WHERE id = :id_asig2 AND id_profesor = :id_prof2)
                             AND m.estado = 'activo'
+                            AND e.id_institucion = :tid3
                             GROUP BY e.id
                             ORDER BY promedio_estudiante DESC";
-        
+
         $stmt_est = $db->prepare($query_estudiantes);
         $stmt_est->execute([
-            ':id_asignacion' => $id_asignacion_filtro, 
-            ':id_asig' => $id_asignacion_filtro, 
-            ':id_asig2' => $id_asignacion_filtro
+            ':id_asignacion' => $id_asignacion_filtro,
+            ':id_asig' => $id_asignacion_filtro, ':id_prof' => $id_profesor,
+            ':id_asig2' => $id_asignacion_filtro, ':id_prof2' => $id_profesor,
+            ':tid3' => $tid
         ]);
         $estudiantes_detalle = $stmt_est->fetchAll(PDO::FETCH_ASSOC);
 
@@ -163,88 +184,46 @@ if ($id_asignacion_filtro) {
         $tipo_mensaje = "danger";
     }
 }
+$activePage = 'reportes';
+$pageTitle = 'Reportes - Educación Plus';
+$mostrarAsignacionesSidebar = true;
+$idAsignacionFiltro = $id_asignacion_filtro;
+ob_start();
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Reportes - Educación Plus</title>
-    
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet">
-    
-    <!-- Chart.js -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    
-    <style>
-        :root { --primary: #2c3e50; --secondary: #3498db; --success: #2ecc71; --warning: #f39c12; --danger: #e74c3c; --sidebar-width: 260px; }
-        body { font-family: 'Segoe UI', sans-serif; background: #f5f7fa; }
-        .sidebar { position: fixed; top: 0; left: 0; height: 100vh; width: var(--sidebar-width); background: var(--primary); color: white; padding-top: 20px; z-index: 1000; overflow-y: auto; }
-        .sidebar .nav-link { color: rgba(255,255,255,0.85); padding: 12px 20px; margin: 2px 0; border-radius: 8px; }
-        .sidebar .nav-link:hover, .sidebar .nav-link.active { color: white; background: rgba(255,255,255,0.15); }
-        .sidebar .nav-link i { width: 24px; text-align: center; margin-right: 8px; }
-        .main-content { margin-left: var(--sidebar-width); padding: 20px; }
-        .card-custom { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); border: none; margin-bottom: 20px; }
-        .stat-card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border-left: 4px solid var(--secondary); transition: transform 0.2s; }
-        .stat-card:hover { transform: translateY(-3px); }
-        .stat-card h3 { font-weight: 700; color: var(--primary); }
-        .student-avatar { width: 35px; height: 35px; border-radius: 50%; background: linear-gradient(135deg, var(--secondary), var(--primary)); color: white; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.8rem; }
-        .progress-thin { height: 6px; }
-        @media (max-width: 992px) { .sidebar { transform: translateX(-100%); } .sidebar.active { transform: translateX(0); } .main-content { margin-left: 0; } }
-    </style>
-</head>
-<body>
-    <!-- Sidebar -->
-    <div class="sidebar" id="sidebar">
-        <div class="text-center mb-4 px-3">
-            <div class="d-flex align-items-center justify-content-center gap-2 mb-2">
-                <div class="bg-white text-primary rounded-circle d-flex align-items-center justify-content-center" style="width: 45px; height: 45px; font-weight: 700;">
-                    <?= strtoupper(substr($profesor['primer_nombre'], 0, 1)) ?>
-                </div>
-                <div class="text-start">
-                    <div class="fw-bold"><?= htmlspecialchars($profesor['primer_nombre']) ?></div>
-                    <small class="text-white-50">Profesor</small>
-                </div>
-            </div>
-        </div>
-        
-        <nav class="nav flex-column px-2">
-            <a class="nav-link" href="aula_virtual.php"><i class="fas fa-chalkboard-teacher"></i> Aula Virtual</a>
-            <a class="nav-link" href="gestionar_estudiantes.php"><i class="fas fa-user-graduate"></i> Estudiantes</a>
-            <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
-            <a class="nav-link active" href="#"><i class="fas fa-chart-bar"></i> Reportes</a>
-            <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
-        </nav>
-        
-        <div class="mt-4 px-3">
-            <small class="text-white-50">Mis Asignaciones</small>
-            <div class="mt-2">
-                <?php foreach ($asignaciones as $asig): ?>
-                <a href="?asignacion=<?= $asig['id'] ?>" class="d-block text-white-50 text-decoration-none py-1 px-2 rounded small <?= $id_asignacion_filtro == $asig['id'] ? 'bg-white-10 text-white' : 'hover-bg-white-10' ?>">
-                    <i class="fas fa-chevron-right me-1 small"></i>
-                    <?= htmlspecialchars($asig['asignatura_nombre']) ?> - <?= htmlspecialchars($asig['grado_nombre']) ?> <?= htmlspecialchars($asig['seccion_nombre']) ?>
-                </a>
-                <?php endforeach; ?>
-            </div>
-        </div>
-    </div>
-
-    <!-- Main Content -->
-    <div class="main-content">
+<!-- Chart.js -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+    .card-custom { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); border: none; margin-bottom: 20px; }
+    .stat-card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); border-left: 4px solid var(--secondary); transition: transform 0.2s; }
+    .stat-card:hover { transform: translateY(-3px); }
+    .stat-card h3 { font-weight: 700; color: var(--primary); }
+    .student-avatar { width: 35px; height: 35px; border-radius: 50%; background: linear-gradient(135deg, var(--secondary), var(--primary)); color: white; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 0.8rem; }
+    .progress-thin { height: 6px; }
+</style>
+<?php
+$extraHead = ob_get_clean();
+require __DIR__ . '/partials/header.php';
+?>
         <!-- Header -->
         <div class="d-flex justify-content-between align-items-center mb-4">
             <div>
                 <h2 class="mb-1"><i class="fas fa-chart-pie"></i> Reportes y Analítica</h2>
                 <nav aria-label="breadcrumb">
                     <ol class="breadcrumb mb-0">
-                        <li class="breadcrumb-item"><a href="aula_virtual.php">Aula Virtual</a></li>
+                        <li class="breadcrumb-item"><a href="profesor_dashboard.php">Dashboard</a></li>
                         <li class="breadcrumb-item active">Reportes</li>
                     </ol>
                 </nav>
             </div>
-            <div>
+            <div class="text-end">
+                <?php if ($asignacion_actual_rep): ?>
+                    <?php if ($nivel_actual_label_rep): ?>
+                    <span class="badge bg-light text-dark border me-1"><i class="fas fa-layer-group"></i> <?= htmlspecialchars($nivel_actual_label_rep) ?></span>
+                    <?php endif; ?>
+                    <span class="badge bg-light text-dark border me-2">
+                        <i class="fas fa-check-circle text-success"></i> Aprueba con <?= number_format($nota_minima_aprobacion, 1) ?>/10
+                    </span>
+                <?php endif; ?>
                 <button class="btn btn-outline-primary" onclick="exportarTabla()">
                     <i class="fas fa-file-csv"></i> Exportar CSV
                 </button>
@@ -368,7 +347,7 @@ if ($id_asignacion_filtro) {
                             
                             // Color de la barra
                             $color = 'bg-danger';
-                            if ($promedio >= 7) $color = 'bg-success';
+                            if ($promedio >= $nota_minima_aprobacion) $color = 'bg-success';
                             elseif ($promedio >= 5) $color = 'bg-warning';
                         ?>
                         <tr>
@@ -387,7 +366,7 @@ if ($id_asignacion_filtro) {
                             <td><?= $entregas ?></td>
                             <td>
                                 <?php if ($promedio > 0): ?>
-                                    <strong class="<?= $promedio >= 7 ? 'text-success' : 'text-danger' ?>"><?= number_format($promedio, 2) ?></strong>
+                                    <strong class="<?= $promedio >= $nota_minima_aprobacion ? 'text-success' : 'text-danger' ?>"><?= number_format($promedio, 2) ?></strong>
                                 <?php else: ?>
                                     <span class="text-muted">-</span>
                                 <?php endif; ?>
@@ -407,10 +386,8 @@ if ($id_asignacion_filtro) {
     </div>
 
     <!-- Scripts -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
-    
+    <?php require __DIR__ . '/partials/scripts.php'; ?>
+
     <script>
         // Datos PHP a JS
         const datosDistribucion = <?= json_encode($datos_distribucion) ?>;

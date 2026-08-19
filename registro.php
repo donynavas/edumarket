@@ -14,23 +14,41 @@ if (isset($_SESSION['user_id'])) {
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
     $database = new Database();
     $db = $database->getConnection();
-    
+    // Resolver la institución del formulario público según el subdominio/host
+    // actual (igual que login.php). El registro NUNCA debe confiar en un
+    // id_institucion enviado por el cliente.
+    $tid = TenantManager::getId();
+
     try {
+        if (!$tid) {
+            throw new Exception('No hay ninguna institución activa configurada para este dominio. Contacte al administrador.');
+        }
+
         $db->beginTransaction(); // ✅ Iniciar transacción para asegurar integridad
-        
+
         // Recibir y sanitizar datos
         $usuario = trim($_POST['usuario'] ?? '');
         $password = $_POST['password'] ?? '';
         $confirm_password = $_POST['confirm_password'] ?? '';
         $email = filter_var(trim($_POST['email'] ?? ''), FILTER_VALIDATE_EMAIL);
-        $rol = $_POST['rol'] ?? 'estudiante';
+        // SEGURIDAD: el auto-registro público SOLO puede crear cuentas de
+        // estudiante. Roles de staff (profesor, director, admin, orientador)
+        // deben ser creados por un administrador ya autenticado desde el
+        // panel correspondiente — de lo contrario cualquier visitante no
+        // autenticado podría auto-otorgarse una cuenta de administrador con
+        // acceso total a la institución (vulnerabilidad crítica de escalación
+        // de privilegios). Se ignora cualquier valor de "rol" enviado por el
+        // cliente distinto de 'estudiante'.
+        $rol = 'estudiante';
         $primer_nombre = trim($_POST['primer_nombre'] ?? '');
         $primer_apellido = trim($_POST['primer_apellido'] ?? '');
         $segundo_nombre = trim($_POST['segundo_nombre'] ?? '');
         $segundo_apellido = trim($_POST['segundo_apellido'] ?? '');
         $dui = trim($_POST['dui'] ?? '');
-        $fecha_nacimiento = $_POST['fecha_nacimiento'] ?? null;
-        $sexo = $_POST['sexo'] ?? '';
+        $fecha_nacimiento = !empty($_POST['fecha_nacimiento']) ? $_POST['fecha_nacimiento'] : null;
+        // sexo es un ENUM('M','F') sin default: un valor vacío causa un error
+        // SQL en modo estricto, así que se normaliza a NULL cuando no se elige.
+        $sexo = !empty($_POST['sexo']) ? $_POST['sexo'] : null;
         $nacionalidad = trim($_POST['nacionalidad'] ?? 'Salvadoreña');
         $celular = trim($_POST['celular'] ?? '');
         $telefono_fijo = trim($_POST['telefono_fijo'] ?? '');
@@ -75,19 +93,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             $errores[] = "El nombre y apellido son obligatorios.";
         }
         
-        // Validar que el usuario no exista
+        // Validar que el usuario no exista (el nombre de usuario es único por
+        // institución, igual que valida login.php — no globalmente, para no
+        // filtrar entre instituciones qué usuarios existen en otras).
         if (empty($errores)) {
-            $check = $db->prepare("SELECT id FROM tbl_usuario WHERE usuario = :usuario");
-            $check->execute([':usuario' => $usuario]);
+            $check = $db->prepare("SELECT id FROM tbl_usuario WHERE usuario = :usuario AND id_institucion = :tid");
+            $check->execute([':usuario' => $usuario, ':tid' => $tid]);
             if ($check->rowCount() > 0) {
                 $errores[] = "El usuario ya está registrado.";
             }
         }
-        
-        // Validar que el email no exista
+
+        // Validar que el email no exista dentro de esta institución
         if (empty($errores)) {
-            $check = $db->prepare("SELECT id FROM tbl_usuario WHERE email = :email");
-            $check->execute([':email' => $email]);
+            $check = $db->prepare("SELECT id FROM tbl_usuario WHERE email = :email AND id_institucion = :tid");
+            $check->execute([':email' => $email, ':tid' => $tid]);
             if ($check->rowCount() > 0) {
                 $errores[] = "El email ya está registrado.";
             }
@@ -99,40 +119,52 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             $tipo_mensaje = 'danger';
         } else {
             // ✅ PASO 1: Insertar en tbl_usuario
+            // Nota: tbl_usuario.nombre es NOT NULL sin default (columna legacy
+            // duplicada respecto a tbl_persona) — se completa con el nombre
+            // completo para que el INSERT no falle.
             $password_hash = password_hash($password, PASSWORD_DEFAULT);
-            $query = "INSERT INTO tbl_usuario (usuario, password, email, rol, estado, fecha_registro) 
-                      VALUES (:usuario, :password, :email, :rol, 1, NOW())";
+            $nombre_completo = trim("$primer_nombre $primer_apellido");
+            $query = "INSERT INTO tbl_usuario (nombre, usuario, password, email, rol, estado, fecha_registro, id_institucion)
+                      VALUES (:nombre, :usuario, :password, :email, :rol, 1, NOW(), :tid)";
             $stmt = $db->prepare($query);
             $stmt->execute([
+                ':nombre' => $nombre_completo,
                 ':usuario' => $usuario,
                 ':password' => $password_hash,
                 ':email' => $email,
-                ':rol' => $rol
+                ':rol' => $rol,
+                ':tid' => $tid
             ]);
             $id_usuario = $db->lastInsertId();
-            
+
             // ✅ PASO 2: Insertar en tbl_persona (con id_usuario como FK)
+            // Nota: tercer_nombre es NOT NULL sin default; se envía vacío ya
+            // que el formulario no lo captura.
+            // tbl_persona no tiene columna id_institucion (se confirmó
+            // contra el esquema real) — insertarla aquí bloqueaba TODO
+            // registro público nuevo.
             $query_persona = "INSERT INTO tbl_persona (
-                id_usuario, 
-                primer_nombre, 
-                segundo_nombre, 
-                primer_apellido, 
+                id_usuario,
+                primer_nombre,
+                segundo_nombre,
+                tercer_nombre,
+                primer_apellido,
                 segundo_apellido,
-                dui, 
-                fecha_nacimiento, 
-                sexo, 
-                nacionalidad, 
-                direccion, 
-                telefono_fijo, 
-                celular, 
+                dui,
+                fecha_nacimiento,
+                sexo,
+                nacionalidad,
+                direccion,
+                telefono_fijo,
+                celular,
                 email,
                 estado
             ) VALUES (
-                :id_usuario, :p_nombre, :s_nombre, :p_apellido, :s_apellido,
-                :dui, :fecha_nac, :sexo, :nacionalidad, :direccion, 
+                :id_usuario, :p_nombre, :s_nombre, '', :p_apellido, :s_apellido,
+                :dui, :fecha_nac, :sexo, :nacionalidad, :direccion,
                 :tel_fijo, :celular, :email, 'activo'
             )";
-            
+
             $stmt_persona = $db->prepare($query_persona);
             $stmt_persona->execute([
                 ':id_usuario' => $id_usuario,
@@ -152,17 +184,23 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             $id_persona = $db->lastInsertId();
             
             // ✅ PASO 3: Insertar en tabla específica según rol
+            // Nota: $rol está forzado a 'estudiante' arriba por seguridad, así
+            // que sólo el primer caso es alcanzable desde este formulario
+            // público. Se dejan los demás casos con id_institucion correcto
+            // por si en el futuro se reutiliza este bloque desde un flujo
+            // administrativo autenticado (p. ej. un admin creando profesores).
             switch ($rol) {
                 case 'estudiante':
                     $query_rol = "INSERT INTO tbl_estudiante (
-                        id_persona, 
-                        nie, 
-                        estado_familiar, 
-                        discapacidad, 
+                        id_persona,
+                        nie,
+                        estado_familiar,
+                        discapacidad,
                         trabaja,
-                        estado
+                        estado,
+                        id_institucion
                     ) VALUES (
-                        :id_persona, :nie, :estado_familiar, :discapacidad, :trabaja, 'activo'
+                        :id_persona, :nie, :estado_familiar, :discapacidad, :trabaja, 'activo', :tid
                     )";
                     $stmt_rol = $db->prepare($query_rol);
                     $stmt_rol->execute([
@@ -170,32 +208,38 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                         ':nie' => $nie,
                         ':estado_familiar' => $_POST['estado_familiar'] ?? 'Convive con ambos padres',
                         ':discapacidad' => $_POST['discapacidad'] ?? 'Ninguna',
-                        ':trabaja' => $_POST['trabaja'] ?? 0
+                        ':trabaja' => $_POST['trabaja'] ?? 0,
+                        ':tid' => $tid
                     ]);
                     break;
-                    
+
                 case 'profesor':
                     $query_rol = "INSERT INTO tbl_profesor (
-                        id_persona, 
-                        especialidad, 
-                        estado
+                        id_persona,
+                        especialidad,
+                        estado,
+                        id_institucion
                     ) VALUES (
-                        :id_persona, :especialidad, 'activo'
+                        :id_persona, :especialidad, 'activo', :tid
                     )";
                     $stmt_rol = $db->prepare($query_rol);
                     $stmt_rol->execute([
                         ':id_persona' => $id_persona,
-                        ':especialidad' => $especialidad
+                        ':especialidad' => $especialidad,
+                        ':tid' => $tid
                     ]);
                     break;
-                    
+
                 case 'director':
+                    // tbl_director no tiene columnas estado ni id_institucion
+                    // (se confirmó contra el esquema real: solo id, id_persona,
+                    // cargo). El aislamiento por tenant ya se dio vía
+                    // tbl_persona/tbl_usuario en los pasos anteriores.
                     $query_rol = "INSERT INTO tbl_director (
-                        id_persona, 
-                        area_responsabilidad, 
-                        estado
+                        id_persona,
+                        cargo
                     ) VALUES (
-                        :id_persona, :area, 'activo'
+                        :id_persona, :area
                     )";
                     $stmt_rol = $db->prepare($query_rol);
                     $stmt_rol->execute([
@@ -203,21 +247,23 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                         ':area' => $area_responsabilidad
                     ]);
                     break;
-                    
+
                 case 'admin':
                     // Los admins pueden no requerir tabla adicional
                     // Si tienes tbl_admin, descomenta esto:
                     /*
                     $query_rol = "INSERT INTO tbl_admin (
-                        id_persona, 
-                        nivel_acceso
+                        id_persona,
+                        nivel_acceso,
+                        id_institucion
                     ) VALUES (
-                        :id_persona, :nivel
+                        :id_persona, :nivel, :tid
                     )";
                     $stmt_rol = $db->prepare($query_rol);
                     $stmt_rol->execute([
                         ':id_persona' => $id_persona,
-                        ':nivel' => $nivel_acceso
+                        ':nivel' => $nivel_acceso,
+                        ':tid' => $tid
                     ]);
                     */
                     break;
@@ -225,18 +271,21 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             
             // ✅ Registrar log de registro
             try {
+                // Nota: tbl_logs_actividad no tiene columnas "descripcion" ni
+                // "fecha" (es fecha_hora, con default automático) — se
+                // corrige para que el log realmente se registre.
+                // tbl_logs_actividad tampoco tiene columna id_institucion.
                 $logQuery = "INSERT INTO tbl_logs_actividad (
-                    id_usuario, 
-                    accion, 
-                    descripcion, 
-                    ip_address,
-                    fecha
+                    id_usuario,
+                    accion,
+                    ip_address
                 ) VALUES (
-                    :id, 'Registro Exitoso', 'Nuevo usuario registrado como $rol', :ip, NOW()
+                    :id, :accion, :ip
                 )";
                 $logStmt = $db->prepare($logQuery);
                 $logStmt->execute([
                     ':id' => $id_usuario,
+                    ':accion' => "Registro exitoso ($rol)",
                     ':ip' => $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0'
                 ]);
             } catch (Exception $logError) {
@@ -255,12 +304,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         }
         
     } catch (PDOException $e) {
-        $db->rollBack(); // ✅ Revertir cambios si hay error
+        if ($db->inTransaction()) $db->rollBack(); // ✅ Revertir cambios si hay error
         error_log("Error en registro: " . $e->getMessage());
         $mensaje = "Error al registrar: " . $e->getMessage();
         $tipo_mensaje = 'danger';
     } catch (Exception $e) {
-        $db->rollBack();
+        if ($db->inTransaction()) $db->rollBack();
         $mensaje = "Error: " . $e->getMessage();
         $tipo_mensaje = 'danger';
     }
@@ -811,28 +860,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                     </div>
                     
                     <!-- Rol -->
-                    <div class="form-group">
-                        <label>Tipo de Usuario *</label>
-                        <select name="rol" class="form-select" id="rolSelector" onchange="actualizarRol()">
-                            <option value="estudiante" <?= ($_POST['rol'] ?? '') == 'estudiante' ? 'selected' : '' ?>>
-                                🎓 Estudiante
-                            </option>
-                            <option value="profesor" <?= ($_POST['rol'] ?? '') == 'profesor' ? 'selected' : '' ?>>
-                                👨‍🏫 Profesor
-                            </option>
-                            <option value="admin" <?= ($_POST['rol'] ?? '') == 'admin' ? 'selected' : '' ?>>
-                                ⚙️ Administrador
-                            </option>
-                            <option value="director" <?= ($_POST['rol'] ?? '') == 'director' ? 'selected' : '' ?>>
-                                👔 Director
-                            </option>
-                        </select>
-                    </div>
-                    
-                    <!-- Campos específicos por rol -->
-                    
+                    <!-- Este formulario público de auto-registro SOLO crea cuentas de
+                         estudiante; el servidor ignora cualquier otro valor de "rol"
+                         (ver registro.php). Las cuentas de profesor, director y
+                         administrador deben ser creadas por un administrador ya
+                         autenticado desde el panel de gestión correspondiente. -->
+                    <input type="hidden" name="rol" value="estudiante">
+
                     <!-- Datos de Estudiante -->
-                    <div class="rol-field" data-rol="estudiante" style="display: none;">
+                    <div class="rol-field" data-rol="estudiante">
                         <div class="form-group">
                             <label>Estado Familiar</label>
                             <select name="estado_familiar" class="form-select">
@@ -846,7 +882,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                             <div class="col-md-6">
                                 <div class="form-group">
                                     <label>Discapacidad</label>
-                                    <input type="text" name="discapacidad" class="form-control" 
+                                    <input type="text" name="discapacidad" class="form-control"
                                            value="<?= htmlspecialchars($_POST['discapacidad'] ?? 'Ninguna') ?>">
                                 </div>
                             </div>
@@ -861,38 +897,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                             </div>
                         </div>
                     </div>
-                    
-                    <!-- Especialidad (solo para profesores) -->
-                    <div class="form-group rol-field" data-rol="profesor" style="display: none;">
-                        <label>Especialidad *</label>
-                        <input type="text" name="especialidad" class="form-control" 
-                               placeholder="Ej: Matemáticas, Ciencias, Lenguaje"
-                               value="<?= htmlspecialchars($_POST['especialidad'] ?? '') ?>">
-                        <small class="text-muted">Área de enseñanza principal</small>
-                    </div>
-                    
-                    <!-- Área de Responsabilidad (solo para directores) -->
-                    <div class="form-group rol-field" data-rol="director" style="display: none;">
-                        <label>Área de Responsabilidad</label>
-                        <select name="area_responsabilidad" class="form-select">
-                            <option value="General">General</option>
-                            <option value="Académica">Académica</option>
-                            <option value="Administrativa">Administrativa</option>
-                            <option value="Convivencia">Convivencia</option>
-                        </select>
-                    </div>
-                    
-                    <!-- Nivel de Acceso (solo para admins) -->
-                    <div class="form-group rol-field" data-rol="admin" style="display: none;">
-                        <label>Nivel de Acceso</label>
-                        <select name="nivel_acceso" class="form-select">
-                            <option value="standard">Estándar</option>
-                            <option value="avanzado">Avanzado</option>
-                            <option value="super">Super Admin</option>
-                        </select>
-                        <small class="text-muted">Define permisos del administrador</small>
-                    </div>
-                    
+
+                    <!-- Los campos de Especialidad (profesor), Área de Responsabilidad
+                         (director) y Nivel de Acceso (admin) se removieron de este
+                         formulario público: esos roles se crean desde el panel de
+                         administración, no por auto-registro. -->
+
                     <!-- Términos -->
                     <div class="form-check mb-4">
                         <input type="checkbox" class="form-check-input" id="terminos" required>
@@ -920,39 +930,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     
     <script>
-        // Configuración de roles
-        const rolesConfig = {
-            estudiante: {
-                icon: 'fa-graduation-cap',
-                label: 'Estudiante',
-                class: 'rol-estudiante',
-                info: '<i class="fas fa-info-circle"></i> <strong>Estudiante:</strong> Acceso a clases, tareas y calificaciones.'
-            },
-            profesor: {
-                icon: 'fa-chalkboard-teacher',
-                label: 'Profesor',
-                class: 'rol-profesor',
-                info: '<i class="fas fa-info-circle"></i> <strong>Profesor:</strong> Gestión de clases, calificaciones y actividades.'
-            },
-            admin: {
-                icon: 'fa-cog',
-                label: 'Administrador',
-                class: 'rol-admin',
-                info: '<i class="fas fa-info-circle"></i> <strong>Admin:</strong> Configuración del sistema y gestión de usuarios.'
-            },
-            director: {
-                icon: 'fa-user-tie',
-                label: 'Director',
-                class: 'rol-director',
-                info: '<i class="fas fa-info-circle"></i> <strong>Director:</strong> Supervisión general y reportes institucionales.'
-            }
-        };
-        
         // Toggle password visibility
         function togglePassword(inputId, btn) {
             const input = document.getElementById(inputId);
             const icon = btn.querySelector('i');
-            
+
             if (input.type === 'password') {
                 input.type = 'text';
                 icon.classList.remove('fa-eye');
@@ -963,49 +945,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 icon.classList.add('fa-eye');
             }
         }
-        
-        // Actualizar UI según rol seleccionado
-        function actualizarRol() {
-            const rol = document.getElementById('rolSelector').value;
-            const config = rolesConfig[rol];
-            
-            // Actualizar badge
-            const badge = document.getElementById('rolBadge');
-            badge.className = `rol-badge ${config.class}`;
-            badge.innerHTML = `<i class="fas ${config.icon}"></i> <span id="rolBadgeText">${config.label}</span>`;
-            
-            // Actualizar info
-            document.getElementById('rolInfo').innerHTML = config.info;
-            
-            // Actualizar texto del botón
-            document.getElementById('btnText').textContent = `Crear Cuenta de ${config.label}`;
-            
-            // Mostrar/ocultar campos específicos
-            document.querySelectorAll('.rol-field').forEach(field => {
-                const fieldRol = field.dataset.rol;
-                field.style.display = (fieldRol === rol) ? 'block' : 'none';
-                
-                // Hacer requeridos los campos del rol activo
-                const inputs = field.querySelectorAll('input, select');
-                inputs.forEach(input => {
-                    if (fieldRol === rol) {
-                        if (input.name === 'especialidad' || input.name === 'area_responsabilidad') {
-                            input.required = true;
-                        }
-                    } else {
-                        input.required = false;
-                    }
-                });
-            });
-        }
-        
+
         // Form validation
+        // Nota: este formulario sólo crea cuentas de estudiante (ver comentario
+        // junto al input hidden "rol"), así que ya no hay selector de rol ni
+        // campos condicionales de staff que validar aquí.
         document.getElementById('registroForm').addEventListener('submit', function(e) {
             const password = document.getElementById('password').value;
             const confirm = document.getElementById('confirm_password').value;
             const terminos = document.getElementById('terminos').checked;
-            const rol = document.getElementById('rolSelector').value;
-            
+
             // Validar contraseñas
             if (password !== confirm) {
                 e.preventDefault();
@@ -1013,37 +962,29 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 document.getElementById('confirm_password').classList.add('is-invalid');
                 return false;
             }
-            
+
             // Validar términos
             if (!terminos) {
                 e.preventDefault();
                 alert('⚠️ Debes aceptar los términos y condiciones');
                 return false;
             }
-            
-            // Validar campos específicos del rol
-            if (rol === 'profesor' && !document.querySelector('[name="especialidad"]').value.trim()) {
-                e.preventDefault();
-                alert('⚠️ La especialidad es requerida para profesores');
-                return false;
-            }
-            
+
             // Show loading
             const btn = this.querySelector('button[type="submit"]');
             btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Registrando...';
             btn.disabled = true;
         });
-        
+
         // Remove invalid state on input
         document.querySelectorAll('.form-control').forEach(input => {
             input.addEventListener('input', function() {
                 this.classList.remove('is-invalid');
             });
         });
-        
+
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {
-            actualizarRol();
             document.querySelector('input[name="primer_nombre"]').focus();
         });
     </script>

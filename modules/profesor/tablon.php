@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea profesor
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
@@ -11,13 +12,15 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del profesor
-$query = "SELECT p.id as id_profesor FROM tbl_profesor p
+$query = "SELECT p.id as id_profesor, per.primer_nombre FROM tbl_profesor p
           JOIN tbl_persona per ON p.id_persona = per.id
-          WHERE per.id_usuario = :user_id";
+          WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $profesor = $stmt->fetch(PDO::FETCH_ASSOC);
 $id_profesor = $profesor['id_profesor'] ?? 0;
@@ -37,18 +40,20 @@ $query = "SELECT ad.id, ad.anno,
           JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
           JOIN tbl_seccion s ON ad.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id  
-          WHERE ad.id_profesor = :id_profesor
+          WHERE ad.id_profesor = :id_profesor AND asig.id_institucion = :tid
           ORDER BY asig.nombre, g.nombre, s.nombre";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':id_profesor', $id_profesor, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $asignaciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Obtener actividades del tablón
 if ($id_asignacion) {
+   // duracion_minutos es TIME en el esquema real; se convierte a minutos.
    $query = "SELECT a.id, a.titulo, a.descripcion, a.tipo, a.contenido, a.url_recurso,
-          a.fecha_programada, a.fecha_limite, a.duracion_minutos, a.nota_maxima, a.estado,
+          a.fecha_programada, a.fecha_limite, TIME_TO_SEC(a.duracion_minutos)/60 as duracion_minutos, a.nota_maxima, a.estado,
           ad.id as id_asignacion, asig.nombre as asignatura, g.nombre as grado, s.nombre as seccion,
           COUNT(DISTINCT ea.id) as total_entregas,
           SUM(CASE WHEN ea.estado_entrega = 'calificado' THEN 1 ELSE 0 END) as calificadas,
@@ -59,9 +64,9 @@ if ($id_asignacion) {
           JOIN tbl_seccion s ON ad.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
           LEFT JOIN tbl_entrega_actividad ea ON a.id = ea.id_actividad
-          WHERE ad.id_profesor = :id_profesor AND ad.id = :id_asignacion";
-    
-    $params = [':id_profesor' => $id_profesor, ':id_asignacion' => $id_asignacion];
+          WHERE ad.id_profesor = :id_profesor AND ad.id = :id_asignacion AND asig.id_institucion = :tid";
+
+    $params = [':id_profesor' => $id_profesor, ':id_asignacion' => $id_asignacion, ':tid' => $tid];
     
     if ($filtro_tipo != 'todas') {
         $query .= " AND a.tipo = :tipo";
@@ -93,13 +98,17 @@ if ($id_asignacion) {
               FROM tbl_matricula m
               JOIN tbl_estudiante e ON m.id_estudiante = e.id
               JOIN tbl_persona p ON e.id_persona = p.id
-              WHERE m.id_seccion = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :id_asig)
-              AND m.anno = (SELECT anno FROM tbl_asignacion_docente WHERE id = :id_asig2)
+              WHERE m.id_seccion = (SELECT id_seccion FROM tbl_asignacion_docente WHERE id = :id_asig AND id_profesor = :id_prof)
+              AND m.anno = (SELECT anno FROM tbl_asignacion_docente WHERE id = :id_asig2 AND id_profesor = :id_prof2)
               AND m.estado = 'activo'
+              AND e.id_institucion = :tid3
               ORDER BY p.primer_apellido, p.primer_nombre";
     $stmt = $db->prepare($query);
     $stmt->bindValue(':id_asig', $id_asignacion, PDO::PARAM_INT);
+    $stmt->bindValue(':id_prof', $id_profesor, PDO::PARAM_INT);
     $stmt->bindValue(':id_asig2', $id_asignacion, PDO::PARAM_INT);
+    $stmt->bindValue(':id_prof2', $id_profesor, PDO::PARAM_INT);
+    $stmt->bindValue(':tid3', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $estudiantes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
@@ -123,73 +132,11 @@ $estados_actividad = [
     'activo' => ['label' => 'Activo', 'class' => 'bg-primary'],
     'cerrado' => ['label' => 'Cerrado', 'class' => 'bg-dark']
 ];
+$activePage = 'tablon';
+$pageTitle = 'Tablón de Clase - Educación Plus';
+ob_start();
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tablón de Clase - Educación Plus</title>
-    
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet">
-    
-    <style>
-        :root {
-            --primary: #2c3e50;
-            --secondary: #3498db;
-            --success: #2ecc71;
-            --warning: #f39c12;
-            --danger: #e74c3c;
-            --info: #17a2b8;
-            --purple: #9b59b6;
-            --sidebar-width: 260px;
-        }
-        
-        body {
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-            background: #f0f2f5;
-        }
-        
-        .sidebar {
-            position: fixed;
-            top: 0;
-            left: 0;
-            height: 100vh;
-            width: var(--sidebar-width);
-            background: var(--primary);
-            color: white;
-            padding-top: 20px;
-            z-index: 1000;
-            overflow-y: auto;
-        }
-        
-        .sidebar .brand {
-            text-align: center;
-            padding: 0 20px 20px;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-            margin-bottom: 20px;
-        }
-        
-        .sidebar .nav-link {
-            color: rgba(255,255,255,0.85);
-            padding: 12px 20px;
-            margin: 2px 10px;
-            border-radius: 8px;
-            transition: all 0.2s;
-        }
-        
-        .sidebar .nav-link:hover, .sidebar .nav-link.active {
-            color: white;
-            background: rgba(255,255,255,0.15);
-        }
-        
-        .main-content {
-            margin-left: var(--sidebar-width);
-            padding: 20px;
-        }
-        
+<style>
         /* Header de clase */
         .class-header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -348,33 +295,11 @@ $estados_actividad = [
             margin-bottom: 20px;
         }
         
-        @media (max-width: 992px) {
-            .sidebar { transform: translateX(-100%); }
-            .sidebar.active { transform: translateX(0); }
-            .main-content { margin-left: 0; }
-        }
-    </style>
-</head>
-<body>
-    <!-- Sidebar -->
-    <div class="sidebar" id="sidebar">
-        <div class="brand">
-            <h4><i class="fas fa-graduation-cap"></i> Educación Plus</h4>
-            <small>Panel del Profesor</small>
-        </div>
-        <nav class="nav flex-column">
-            <a class="nav-link" href="profesor_dashboard.php"><i class="fas fa-home"></i> Dashboard</a>
-            <a class="nav-link active" href="tablon.php"><i class="fas fa-chalkboard"></i> Tablón</a>
-            <a class="nav-link" href="aula_virtual.php"><i class="fas fa-video"></i> Aula Virtual</a>
-            <a class="nav-link" href="gestionar_actividades.php"><i class="fas fa-tasks"></i> Actividades</a>
-            <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
-            
-            <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
-        </nav>
-    </div>
-
-    <!-- Main Content -->
-    <div class="main-content">
+</style>
+<?php
+$extraHead = ob_get_clean();
+require __DIR__ . '/partials/header.php';
+?>
         <?php if (!$id_asignacion): ?>
         <!-- Selección de Clase -->
         <div class="class-header">
@@ -591,17 +516,21 @@ $estados_actividad = [
     </div>
 
     <!-- Scripts -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
-    
+    <?php require __DIR__ . '/partials/scripts.php'; ?>
+
     <script>
         // Inicializar Select2
         $(document).ready(function() {
-            $('select').select2({
-                theme: 'bootstrap-5',
-                width: '100%'
-            });
+            try {
+                if (window.jQuery && jQuery.fn.select2) {
+                    $('select').select2({
+                        theme: 'bootstrap-5',
+                        width: '100%'
+                    });
+                }
+            } catch (e) {
+                console.error('select2 no disponible:', e);
+            }
         });
         
         // Eliminar actividad

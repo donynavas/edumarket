@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -11,25 +12,28 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del estudiante
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante, e.nie,
           p.primer_nombre, p.primer_apellido,
           g.id as id_grado, g.nombre as grado_nombre,
           s.id as id_seccion, s.nombre as seccion_nombre,
-          m.id as id_matricula, m.anno, m.id_periodo
+          m.id as id_matricula, m.anno
           FROM tbl_estudiante e
           JOIN tbl_persona p ON e.id_persona = p.id
           JOIN tbl_matricula m ON e.id = m.id_estudiante
           JOIN tbl_seccion s ON m.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
           WHERE p.id_usuario = :user_id
+          AND e.id_institucion = :tid
           AND m.estado = 'activo'
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -65,7 +69,7 @@ $id_estudiante = $estudiante['id_estudiante'];
 $id_matricula = $estudiante['id_matricula'];
 $id_seccion = $estudiante['id_seccion'];
 $anno = $estudiante['anno'];
-$periodo = $estudiante['id_periodo'];
+// NOTA: ya no se filtra por "período" -- ver estudiante_dashboard.php.
 
 // ===== OBTENER EVALUACIONES =====
 $filtro_tipo = $_GET['tipo'] ?? 'todos';
@@ -77,24 +81,31 @@ $filtro_fecha_fin = $_GET['fecha_fin'] ?? date('Y-m-t');
 $query_materias = "SELECT asig.id, asig.nombre 
                    FROM tbl_asignacion_docente ad
                    JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
-                   WHERE ad.id_seccion = :id_seccion AND ad.anno = :anno AND ad.id_periodo = :periodo
+                   WHERE ad.id_seccion = :id_seccion AND ad.anno = :anno
                    ORDER BY asig.nombre";
 $stmt_materias = $db->prepare($query_materias);
 $stmt_materias->execute([
     ':id_seccion' => $id_seccion,
-    ':anno' => $anno,
-    ':periodo' => $periodo
+    ':anno' => $anno
 ]);
 $materias = $stmt_materias->fetchAll(PDO::FETCH_ASSOC);
 
 // Consulta principal de evaluaciones
-$query_evaluaciones = "SELECT 
-    act.id, act.titulo, act.descripcion, act.tipo, act.fecha_programada, act.fecha_limite,
+//
+// Igual que en el resto de la sección estudiante: un examen calificado no
+// deja fila en tbl_entrega_actividad, su nota vive en
+// tbl_intento_examen. vw_logro_estudiante (migrations/2026_08_16_vista_
+// logro_estudiante.sql) unifica ambas fuentes.
+$query_evaluaciones = "SELECT
+    act.id, act.id_examen, act.titulo, act.descripcion, act.tipo, act.fecha_programada, act.fecha_limite,
     act.nota_maxima, act.estado as estado_actividad,
     asig.nombre as asignatura, asig.codigo,
     per.primer_nombre as profesor_nombre, per.primer_apellido as profesor_apellido,
-    ea.id as id_entrega, ea.nota_obtenida, ea.estado_entrega, ea.retroalimentacion,
-    CASE 
+    v.id_registro_origen as id_entrega,
+    v.nota_obtenida,
+    v.estado_entrega,
+    v.observacion_docente as retroalimentacion,
+    CASE
         WHEN act.tipo = 'examen' THEN 'Examen'
         WHEN act.tipo = 'tarea' THEN 'Tarea'
         WHEN act.tipo = 'laboratorio' THEN 'Laboratorio'
@@ -107,10 +118,9 @@ $query_evaluaciones = "SELECT
     JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
     JOIN tbl_profesor prof ON ad.id_profesor = prof.id
     JOIN tbl_persona per ON prof.id_persona = per.id
-    LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad AND ea.id_matricula = :id_matricula
+    LEFT JOIN vw_logro_estudiante v ON v.id_actividad = act.id AND v.id_matricula = :id_matricula
     WHERE ad.id_seccion = :id_seccion
     AND ad.anno = :anno
-    AND ad.id_periodo = :periodo
     AND act.tipo IN ('examen', 'tarea', 'laboratorio', 'proyecto')
     AND act.estado IN ('publicado', 'activo')
     AND (act.fecha_programada BETWEEN :fecha_inicio AND :fecha_fin OR act.fecha_limite BETWEEN :fecha_inicio2 AND :fecha_fin2)";
@@ -119,7 +129,6 @@ $params = [
     ':id_matricula' => $id_matricula,
     ':id_seccion' => $id_seccion,
     ':anno' => $anno,
-    ':periodo' => $periodo,
     ':fecha_inicio' => $filtro_fecha_inicio . ' 00:00:00',
     ':fecha_fin' => $filtro_fecha_fin . ' 23:59:59',
     ':fecha_inicio2' => $filtro_fecha_inicio . ' 00:00:00',

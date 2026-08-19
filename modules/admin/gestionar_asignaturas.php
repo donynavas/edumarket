@@ -8,6 +8,8 @@ if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'direc
     exit;
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 $mensaje = '';
@@ -16,74 +18,73 @@ $tipo_mensaje = '';
 // ===== PROCESAR ACCIONES POST =====
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $accion = $_POST['accion'] ?? '';
-    
+
     try {
         $db->beginTransaction();
-        
+
         switch($accion) {
             case 'crear':
                 $nombre = trim($_POST['nombre']);
                 $codigo = trim(strtoupper($_POST['codigo']));
-                
-                $stmt = $db->prepare("SELECT id FROM tbl_asignatura WHERE codigo = :codigo");
-                $stmt->execute([':codigo' => $codigo]);
+
+                $stmt = $db->prepare("SELECT id FROM tbl_asignatura WHERE codigo = :codigo AND id_institucion = :tid");
+                $stmt->execute([':codigo' => $codigo, ':tid' => $tid]);
                 if ($stmt->fetch()) throw new Exception('El código ya existe');
-                
-                $stmt = $db->prepare("INSERT INTO tbl_asignatura (nombre, codigo) VALUES (:nombre, :codigo)");
-                $stmt->execute([':nombre' => $nombre, ':codigo' => $codigo]);
+
+                $stmt = $db->prepare("INSERT INTO tbl_asignatura (nombre, codigo, id_institucion) VALUES (:nombre, :codigo, :tid)");
+                $stmt->execute([':nombre' => $nombre, ':codigo' => $codigo, ':tid' => $tid]);
                 $mensaje = 'Asignatura creada';
                 break;
-                
+
             case 'actualizar':
-                $id = $_POST['id_asignatura'];
+                $id = (int)$_POST['id_asignatura'];
+                TenantGuard::assertOwner($db, 'tbl_asignatura', $id);
                 $nombre = trim($_POST['nombre']);
                 $codigo = trim(strtoupper($_POST['codigo']));
-                
-                $stmt = $db->prepare("SELECT id FROM tbl_asignatura WHERE codigo = :codigo AND id != :id");
-                $stmt->execute([':codigo' => $codigo, ':id' => $id]);
+
+                $stmt = $db->prepare("SELECT id FROM tbl_asignatura WHERE codigo = :codigo AND id != :id AND id_institucion = :tid");
+                $stmt->execute([':codigo' => $codigo, ':id' => $id, ':tid' => $tid]);
                 if ($stmt->fetch()) throw new Exception('El código ya existe');
-                
+
                 $stmt = $db->prepare("UPDATE tbl_asignatura SET nombre = :nombre, codigo = :codigo WHERE id = :id");
                 $stmt->execute([':nombre' => $nombre, ':codigo' => $codigo, ':id' => $id]);
                 $mensaje = 'Asignatura actualizada';
                 break;
-                
+
             case 'eliminar':
-                $id = $_POST['id_asignatura'];
-                $db->exec("DELETE act FROM tbl_actividad act JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id WHERE ad.id_asignatura = $id");
+                // ✅ Corregido: el id venía interpolado directo en el SQL (inyección
+                // SQL) y sin verificar que la asignatura fuera de esta institución.
+                $id = (int)$_POST['id_asignatura'];
+                TenantGuard::assertOwner($db, 'tbl_asignatura', $id);
+                $del = $db->prepare("DELETE act FROM tbl_actividad act JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id WHERE ad.id_asignatura = :id");
+                $del->execute([':id' => $id]);
                 $db->prepare("DELETE FROM tbl_asignacion_docente WHERE id_asignatura = :id")->execute([':id' => $id]);
                 $db->prepare("DELETE FROM tbl_asignatura WHERE id = :id")->execute([':id' => $id]);
                 $mensaje = 'Asignatura eliminada';
                 $tipo_mensaje = 'warning';
                 break;
-                
+
             case 'eliminar_asignacion':
-                $id = $_POST['id_asignacion'];
+                $id = (int)$_POST['id_asignacion'];
+                TenantGuard::assertOwner($db, 'tbl_asignacion_docente', $id);
                 $db->prepare("DELETE FROM tbl_actividad WHERE id_asignacion_docente = :id")->execute([':id' => $id]);
                 $db->prepare("DELETE FROM tbl_asignacion_docente WHERE id = :id")->execute([':id' => $id]);
                 $mensaje = 'Asignación eliminada';
                 $tipo_mensaje = 'warning';
                 break;
-                
-            case 'asignar_profesor':
-                $stmt = $db->prepare("INSERT INTO tbl_asignacion_docente (id_profesor, id_asignatura, id_seccion, id_periodo, anno) VALUES (:prof, :asig, :sec, :per, :anno)");
-                $stmt->execute([
-                    ':prof' => $_POST['id_profesor'],
-                    ':asig' => $_POST['id_asignatura'],
-                    ':sec' => $_POST['id_seccion'],
-                    ':per' => $_POST['id_periodo'],
-                    ':anno' => $_POST['anno']
-                ]);
-                $mensaje = 'Profesor asignado';
-                break;
-                
+
+            // 'asignar_profesor' se retiró de aquí (Fase 4): quedaba duplicado
+            // con "Asignar Materias" en gestionar_profesores.php, con una
+            // Sección sin cascada de Grado. Esa queda como implementación
+            // única -- ver la nota junto al botón "Asignar Profesor" más abajo.
+
             default:
                 throw new Exception('Acción no válida');
         }
-        
+
         $db->commit();
         $tipo_mensaje = $tipo_mensaje ?: 'success';
-        
+
     } catch (Exception $e) {
         $db->rollBack();
         $mensaje = 'Error: ' . $e->getMessage();
@@ -101,9 +102,9 @@ $query = "SELECT a.id, a.nombre, a.codigo,
           FROM tbl_asignatura a
           LEFT JOIN tbl_asignacion_docente ad ON a.id = ad.id_asignatura
           LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente
-          WHERE 1=1";
+          WHERE a.id_institucion = :tid";
 
-$params = [];
+$params = [':tid' => $tid];
 if (!empty($busqueda)) {
     $query .= " AND (a.nombre LIKE :busqueda OR a.codigo LIKE :busqueda)";
     $params[':busqueda'] = "%{$busqueda}%";
@@ -116,30 +117,27 @@ $stmt->execute();
 $asignaturas = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Datos auxiliares
-$profesores = $db->query("SELECT p.id, CONCAT(per.primer_nombre, ' ', per.primer_apellido) as nombre_completo, p.especialidad
+$stmtProf = $db->prepare("SELECT p.id, CONCAT(per.primer_nombre, ' ', per.primer_apellido) as nombre_completo, p.especialidad
                           FROM tbl_profesor p
                           JOIN tbl_persona per ON p.id_persona = per.id
                           JOIN tbl_usuario u ON per.id_usuario = u.id
-                          WHERE u.estado = 1 ORDER BY per.primer_apellido")->fetchAll(PDO::FETCH_ASSOC);
+                          WHERE u.estado = 1 AND p.id_institucion = :tid ORDER BY per.primer_apellido");
+$stmtProf->execute([':tid' => $tid]);
+$profesores = $stmtProf->fetchAll(PDO::FETCH_ASSOC);
 
-$secciones = $db->query("SELECT s.id, CONCAT(g.nombre, ' - ', s.nombre) as nombre_completo
-                         FROM tbl_seccion s
-                         JOIN tbl_grado g ON s.id_grado = g.id
-                         ORDER BY g.nombre, s.nombre")->fetchAll(PDO::FETCH_ASSOC);
-
-$asignacionesDocentes = $db->query("SELECT ad.id, CONCAT(per.primer_nombre, ' ', per.primer_apellido) as profesor, 
-                                    a.nombre as asignatura, CONCAT(g.nombre, ' - ', s.nombre) as seccion, 
-                                    ad.id_periodo, ad.anno
+$stmtAsigDoc = $db->prepare("SELECT ad.id, CONCAT(per.primer_nombre, ' ', per.primer_apellido) as profesor,
+                                    a.nombre as asignatura, CONCAT(g.nombre, ' - ', s.nombre) as seccion,
+                                    ad.anno
                                     FROM tbl_asignacion_docente ad
                                     JOIN tbl_profesor p ON ad.id_profesor = p.id
                                     JOIN tbl_persona per ON p.id_persona = per.id
                                     JOIN tbl_asignatura a ON ad.id_asignatura = a.id
                                     JOIN tbl_seccion s ON ad.id_seccion = s.id
                                     JOIN tbl_grado g ON s.id_grado = g.id
-                                    ORDER BY per.primer_apellido, a.nombre")->fetchAll(PDO::FETCH_ASSOC);
-
-$periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Trimestre', 4 => 'Cuarto Trimestre'];
-$anno_actual = date('Y');
+                                    WHERE p.id_institucion = :tid
+                                    ORDER BY per.primer_apellido, a.nombre");
+$stmtAsigDoc->execute([':tid' => $tid]);
+$asignacionesDocentes = $stmtAsigDoc->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -177,6 +175,7 @@ $anno_actual = date('Y');
             <a class="nav-link" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link active" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
             <a class="nav-link" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
+            <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </div>
@@ -193,9 +192,9 @@ $anno_actual = date('Y');
                 <button class="btn btn-primary me-2" data-bs-toggle="modal" data-bs-target="#modalAsignatura" onclick="prepararModal('crear')">
                     <i class="fas fa-plus"></i> Nueva
                 </button>
-                <button class="btn btn-success" data-bs-toggle="modal" data-bs-target="#modalAsignarProfesor">
+                <a href="gestionar_profesores.php" class="btn btn-success">
                     <i class="fas fa-user-plus"></i> Asignar Profesor
-                </button>
+                </a>
             </div>
         </div>
 
@@ -243,9 +242,10 @@ $anno_actual = date('Y');
                             <tr><th>Código</th><th>Asignatura</th><th>Profesores</th><th>Asignaciones</th><th>Actividades</th><th>Acciones</th></tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($asignaturas)): ?>
-                            <tr><td colspan="6" class="text-center py-5 text-muted"><i class="fas fa-inbox fa-3x mb-3 d-block"></i>No hay asignaturas</td></tr>
-                            <?php else: ?>
+                            <?php // Sin fila manual de "sin datos": con DataTables, una tbody con una
+                            // sola fila de 1 <td colspan> frente a un thead de más columnas dispara
+                            // "Incorrect column count" (tn/18). Con tbody vacío, DataTables muestra
+                            // su propio mensaje localizado (idioma es-ES cargado abajo). ?>
                             <?php foreach ($asignaturas as $a): ?>
                             <tr>
                                 <td><span class="codigo-badge"><?= htmlspecialchars($a['codigo']) ?></span></td>
@@ -263,7 +263,6 @@ $anno_actual = date('Y');
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -274,28 +273,26 @@ $anno_actual = date('Y');
         <div class="card-custom">
             <div class="card-header bg-white py-3">
                 <h5 class="mb-0"><i class="fas fa-chalkboard-teacher"></i> Asignaciones Docentes</h5>
+                <small class="text-muted">Para asignar profesores, ve a <a href="gestionar_profesores.php">Profesores → Asignar Materias</a>.</small>
             </div>
             <div class="card-body p-0">
                 <div class="table-responsive">
                     <table class="table table-hover mb-0" id="tablaAsignaciones">
                         <thead class="table-light">
-                            <tr><th>Profesor</th><th>Asignatura</th><th>Sección</th><th>Período</th><th>Año</th><th>Acciones</th></tr>
+                            <tr><th>Profesor</th><th>Asignatura</th><th>Sección</th><th>Año</th><th>Acciones</th></tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($asignacionesDocentes)): ?>
-                            <tr><td colspan="6" class="text-center py-5 text-muted"><i class="fas fa-inbox fa-3x mb-3 d-block"></i>No hay asignaciones</td></tr>
-                            <?php else: ?>
+                            <?php // Sin fila manual de "sin datos" (mismo motivo que la tabla de
+                            // arriba: evita "Incorrect column count" de DataTables, tn/18). ?>
                             <?php foreach ($asignacionesDocentes as $ad): ?>
                             <tr>
                                 <td><?= htmlspecialchars($ad['profesor']) ?></td>
                                 <td><?= htmlspecialchars($ad['asignatura']) ?></td>
                                 <td><?= htmlspecialchars($ad['seccion']) ?></td>
-                                <td><?= $periodos[$ad['id_periodo']] ?? 'N/A' ?></td>
                                 <td><?= $ad['anno'] ?></td>
                                 <td><button class="btn btn-sm btn-danger" onclick="eliminarAsignacion(<?= $ad['id'] ?>, '<?= htmlspecialchars(explode(' ', $ad['profesor'])[0]) ?>', '<?= htmlspecialchars($ad['asignatura']) ?>')"><i class="fas fa-trash"></i></button></td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -334,68 +331,6 @@ $anno_actual = date('Y');
         </div>
     </div>
 
-    <!-- Modal Asignar Profesor -->
-    <div class="modal fade" id="modalAsignarProfesor" tabindex="-1">
-        <div class="modal-dialog">
-            <div class="modal-content">
-                <div class="modal-header bg-success text-white">
-                    <h5 class="modal-title"><i class="fas fa-user-plus"></i> Asignar Profesor</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                </div>
-                <form method="POST">
-                    <div class="modal-body">
-                        <input type="hidden" name="accion" value="asignar_profesor">
-                        <div class="mb-3">
-                            <label class="form-label">Profesor *</label>
-                            <select name="id_profesor" class="form-select select2" required>
-                                <option value="">Seleccionar</option>
-                                <?php foreach ($profesores as $p): ?>
-                                <option value="<?= $p['id'] ?>"><?= htmlspecialchars($p['nombre_completo']) ?> (<?= htmlspecialchars($p['especialidad']) ?>)</option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label">Asignatura *</label>
-                            <select name="id_asignatura" class="form-select select2" required>
-                                <option value="">Seleccionar</option>
-                                <?php foreach ($asignaturas as $a): ?>
-                                <option value="<?= $a['id'] ?>"><?= htmlspecialchars($a['nombre']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label">Sección *</label>
-                            <select name="id_seccion" class="form-select select2" required>
-                                <option value="">Seleccionar</option>
-                                <?php foreach ($secciones as $s): ?>
-                                <option value="<?= $s['id'] ?>"><?= htmlspecialchars($s['nombre_completo']) ?></option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Período *</label>
-                                <select name="id_periodo" class="form-select" required>
-                                    <?php foreach ($periodos as $k => $v): ?>
-                                    <option value="<?= $k ?>"><?= $v ?></option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Año *</label>
-                                <input type="number" name="anno" class="form-control" value="<?= $anno_actual ?>" required>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
-                        <button type="submit" class="btn btn-success"><i class="fas fa-save"></i> Guardar</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-
     <!-- Modal Ver -->
     <div class="modal fade" id="modalVerAsignatura" tabindex="-1">
         <div class="modal-dialog modal-lg">
@@ -426,7 +361,12 @@ $anno_actual = date('Y');
                 language: { url: '//cdn.datatables.net/plug-ins/1.13.4/i18n/es-ES.json' },
                 pageLength: 10, order: [[0, 'asc']], responsive: true
             });
-            $('.select2').select2({ placeholder: 'Seleccionar', width: '100%' });
+            try {
+                $('.select2').select2({ placeholder: 'Seleccionar', width: '100%' });
+            } catch (e) {
+                console.error('select2 no se pudo inicializar; los <select> siguen funcionando en modo nativo.', e);
+            }
+
             $('#nombre_asignatura').on('input', function() {
                 const codigo = $(this).val().toUpperCase().substring(0, 3) + '-' + Math.floor(Math.random() * 900 + 100);
                 $('#codigo_asignatura').val(codigo);
@@ -448,7 +388,7 @@ $anno_actual = date('Y');
             $.ajax({
                 url: 'api/get_asignatura.php',
                 method: 'GET',
-                 { id: id },
+                data: { id: id },
                 dataType: 'json',
                 success: function(res) {
                     if (res.success) {
@@ -481,7 +421,7 @@ $anno_actual = date('Y');
             $.ajax({
                 url: 'api/get_asignatura.php',
                 method: 'GET',
-                 { id: id, action: 'editar' },
+                data: { id: id, action: 'editar' },
                 dataType: 'json',
                 success: function(res) {
                     if (res.success) {
@@ -511,7 +451,7 @@ $anno_actual = date('Y');
             $.ajax({
                 url: 'api/get_profesores_asignatura.php',
                 method: 'GET',
-                 { id_asignatura: id },
+                data: { id_asignatura: id },
                 success: function(html) { $('#infoAsignatura').html(html); },
                 error: function(xhr) {
                     console.error('Error:', xhr.responseText);

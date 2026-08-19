@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -11,6 +12,7 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener ID de la asignatura desde la URL
 $id_asignacion = filter_input(INPUT_GET, 'id_asignacion', FILTER_VALIDATE_INT);
@@ -20,9 +22,9 @@ if (!$id_asignacion) {
 }
 
 // Obtener datos del estudiante y matrícula
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante,
-          m.id as id_matricula, m.anno, m.id_periodo,
+          m.id as id_matricula, m.anno,
           s.id as id_seccion,
           p.primer_nombre, p.primer_apellido
           FROM tbl_estudiante e
@@ -31,10 +33,12 @@ $query = "SELECT
           JOIN tbl_seccion s ON m.id_seccion = s.id
           WHERE p.id_usuario = :user_id
           AND m.estado = 'activo'
+          AND e.id_institucion = :tid
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $datos = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -47,31 +51,34 @@ $id_estudiante = $datos['id_estudiante'];
 $id_matricula = $datos['id_matricula'];
 $id_seccion = $datos['id_seccion'];
 $anno = $datos['anno'];
-$periodo = $datos['id_periodo'];
+// NOTA: ya no se filtra por "período" -- ver estudiante_dashboard.php.
 
 // ===== VERIFICAR QUE LA MATERIA PERTENECE AL ESTUDIANTE =====
-// ✅ CORREGIDO: Eliminado 'act.id_periodo' del JOIN
-$query_materia = "SELECT 
+// Igual que en actividades.php: los exámenes no tienen fila en
+// tbl_entrega_actividad, su nota vive en tbl_intento_examen.
+// vw_logro_estudiante (migrations/2026_08_16_vista_logro_estudiante.sql)
+// unifica ambas fuentes.
+$query_materia = "SELECT
     ad.id as id_asignacion,
     asig.id as id_asignatura, asig.nombre as asignatura, asig.codigo,
     pf.id as id_profesor, per.primer_nombre as prof_nombre, per.primer_apellido as prof_apellido, per.email as prof_email,
     pf.especialidad,
     g.nombre as grado_nombre, s.nombre as seccion_nombre,
     COUNT(DISTINCT act.id) as total_actividades,
-    AVG(ea.nota_obtenida) as promedio_materia
+    AVG(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) as promedio_materia
     FROM tbl_asignacion_docente ad
     JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
     JOIN tbl_profesor pf ON ad.id_profesor = pf.id
     JOIN tbl_persona per ON pf.id_persona = per.id
     JOIN tbl_seccion s ON ad.id_seccion = s.id
     JOIN tbl_grado g ON s.id_grado = g.id
-    LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente 
+    LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente
         AND act.estado IN ('publicado', 'activo')
-    LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad AND ea.id_matricula = :id_matricula
+    LEFT JOIN vw_logro_estudiante v ON v.id_actividad = act.id AND v.id_matricula = :id_matricula
     WHERE ad.id = :id_asignacion
     AND ad.id_seccion = :id_seccion
     AND ad.anno = :anno
-    AND ad.id_periodo = :periodo
+    AND asig.id_institucion = :tid
     GROUP BY ad.id";
 
 $stmt_materia = $db->prepare($query_materia);
@@ -79,8 +86,8 @@ $stmt_materia->execute([
     ':id_asignacion' => $id_asignacion,
     ':id_seccion' => $id_seccion,
     ':anno' => $anno,
-    ':periodo' => $periodo,
-    ':id_matricula' => $id_matricula
+    ':id_matricula' => $id_matricula,
+    ':tid' => $tid
 ]);
 $materia = $stmt_materia->fetch(PDO::FETCH_ASSOC);
 
@@ -115,18 +122,27 @@ if (!$materia) {
 $filtro_tipo = $_GET['tipo'] ?? 'todos';
 $filtro_estado = $_GET['estado'] ?? 'todos';
 
-$query_actividades = "SELECT 
-    act.id, act.titulo, act.descripcion, act.tipo, act.fecha_programada, act.fecha_limite, 
+$query_actividades = "SELECT
+    act.id, act.id_examen, act.titulo, act.descripcion, act.tipo, act.fecha_programada, act.fecha_limite,
     act.nota_maxima, act.estado as estado_actividad, act.contenido, act.url_recurso,
-    ea.id as id_entrega, ea.archivo_url, ea.estado_entrega, 
-    ea.nota_obtenida, ea.observacion_docente, ea.fecha_entrega,
+    v.id_registro_origen as id_entrega,
+    ea.archivo_url,
+    v.estado_entrega,
+    v.nota_obtenida,
+    v.observacion_docente,
+    v.fecha_entrega,
     DATEDIFF(act.fecha_limite, NOW()) as dias_restantes
     FROM tbl_actividad act
     LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad AND ea.id_matricula = :id_matricula
+    LEFT JOIN vw_logro_estudiante v ON v.id_actividad = act.id AND v.id_matricula = :id_matricula_v
     WHERE act.id_asignacion_docente = :id_asignacion
     AND act.estado IN ('publicado', 'activo')";
 
-$params = [':id_matricula' => $id_matricula, ':id_asignacion' => $id_asignacion];
+$params = [
+    ':id_matricula' => $id_matricula,
+    ':id_matricula_v' => $id_matricula,
+    ':id_asignacion' => $id_asignacion
+];
 
 if ($filtro_tipo != 'todos') {
     $query_actividades .= " AND act.tipo = :tipo";
@@ -134,11 +150,11 @@ if ($filtro_tipo != 'todos') {
 }
 
 if ($filtro_estado == 'pendientes') {
-    $query_actividades .= " AND (ea.id IS NULL OR ea.estado_entrega != 'calificado') AND act.fecha_limite >= CURDATE()";
+    $query_actividades .= " AND (v.id_registro_origen IS NULL OR v.estado_entrega != 'calificado') AND act.fecha_limite >= CURDATE()";
 } elseif ($filtro_estado == 'entregadas') {
-    $query_actividades .= " AND ea.id IS NOT NULL AND ea.estado_entrega = 'entregado'";
+    $query_actividades .= " AND v.id_registro_origen IS NOT NULL AND v.estado_entrega = 'entregado'";
 } elseif ($filtro_estado == 'calificadas') {
-    $query_actividades .= " AND ea.id IS NOT NULL AND ea.estado_entrega = 'calificado'";
+    $query_actividades .= " AND v.id_registro_origen IS NOT NULL AND v.estado_entrega = 'calificado'";
 }
 
 $query_actividades .= " ORDER BY act.fecha_limite ASC";
@@ -353,9 +369,9 @@ $tipos_actividad = [
                                 <?php endif; ?>
                             </div>
                             <div class="col-md-3">
-                                <small class="d-block"><i class="fas fa-calendar"></i> <?= date('d/m/Y', strtotime($act['fecha_limite'])) ?></small>
-                                <small class="d-block <?= $dias <= 2 && $dias >= 0 ? 'text-danger fw-bold' : '' ?>">
-                                    <i class="fas fa-clock"></i> <?= $dias >= 0 ? $dias . ' días' : 'Vencida' ?>
+                                <small class="d-block"><i class="fas fa-calendar"></i> <?= $act['fecha_limite'] ? date('d/m/Y', strtotime($act['fecha_limite'])) : 'Sin fecha límite' ?></small>
+                                <small class="d-block <?= $dias !== null && $dias <= 2 && $dias >= 0 ? 'text-danger fw-bold' : '' ?>">
+                                    <i class="fas fa-clock"></i> <?= $dias === null ? '' : ($dias >= 0 ? $dias . ' días' : 'Vencida') ?>
                                 </small>
                             </div>
                             <div class="col-md-2 text-center">

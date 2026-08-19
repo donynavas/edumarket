@@ -8,6 +8,8 @@ if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'direc
     exit;
 }
 
+require_once __DIR__ . '/../../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 
@@ -69,9 +71,10 @@ LEFT JOIN tbl_asistencia ast ON m.id = ast.id_matricula AND ast.fecha BETWEEN
 WHERE m.anno = :anno
 AND m.id_periodo = :periodo
 AND m.estado = 'activo'
-AND ad.id_asignatura = :asignatura";
+AND ad.id_asignatura = :asignatura
+AND g.id_institucion = :tid";
 
-$params = [':anno' => $anno, ':periodo' => $periodo, ':asignatura' => $asignatura];
+$params = [':anno' => $anno, ':periodo' => $periodo, ':asignatura' => $asignatura, ':tid' => $tid];
 
 if ($grado) { $query .= " AND g.id = :grado"; $params[':grado'] = $grado; }
 if ($seccion) { $query .= " AND s.id = :seccion"; $params[':seccion'] = $seccion; }
@@ -157,14 +160,16 @@ function generarExcel($datos, $anno, $periodo, $asistencia, $observaciones) {
         for ($i = 0; $i < 4; $i++) {
             $sheet->setCellValue(chr(67 + $i) . $row, rand(7, 10)); // Valores de ejemplo
         }
-        $sheet->setCellValue('G' . $row, '=SUM(C' . $row . ':F' . $row) . ')');
+        // ✅ Corregido: paréntesis mal colocado rompía la sintaxis del archivo
+        // (faltaba cerrar la fórmula de Excel antes de cerrar la llamada a PHP).
+        $sheet->setCellValue('G' . $row, '=SUM(C' . $row . ':F' . $row . ')');
         $sheet->setCellValue('H' . $row, '=G' . $row . '*0.35/4');
-        
+
         // AREA 2
         for ($i = 0; $i < 4; $i++) {
             $sheet->setCellValue(chr(73 + $i) . $row, rand(7, 10));
         }
-        $sheet->setCellValue('N' . $row, '=SUM(I' . $row . ':M' . $row) . ')');
+        $sheet->setCellValue('N' . $row, '=SUM(I' . $row . ':M' . $row . ')');
         $sheet->setCellValue('O' . $row, '=N' . $row . '*0.35/4');
         
         // AREA 3 / EXAMEN

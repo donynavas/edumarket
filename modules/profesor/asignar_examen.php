@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea profesor
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
@@ -11,78 +12,71 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 $id_profesor = null;
 
 // Obtener ID del profesor
-$query = "SELECT id FROM tbl_profesor WHERE id_persona = (
-    SELECT id FROM tbl_persona WHERE id_usuario = :user_id
-)";
+$query = "SELECT p.id, per.primer_nombre FROM tbl_profesor p
+    JOIN tbl_persona per ON p.id_persona = per.id
+    WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute([':user_id' => $user_id]);
+$stmt->execute([':user_id' => $user_id, ':tid' => $tid]);
 $profesor_data = $stmt->fetch(PDO::FETCH_ASSOC);
 $id_profesor = $profesor_data['id'] ?? 0;
+$profesor = $profesor_data ?: [];
 
 $mensaje = '';
 $tipo_mensaje = '';
 
-// ===== PROCESAR CREACIÓN DE EXAMEN =====
+// ===== ACCIONES SOBRE EXÁMENES EXISTENTES (tbl_examen) =====
+// La creación/edición de contenido del examen (preguntas de los 5 tipos) se hace
+// en crear_examen.php; aquí sólo se gestiona el ciclo de vida (publicar/cerrar/eliminar)
+// de exámenes que ya pertenecen a este profesor.
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
     try {
         $db->beginTransaction();
-        
-        if ($_POST['accion'] == 'crear_examen') {
-            $id_asignacion = $_POST['id_asignacion'];
-            $titulo = trim($_POST['titulo']);
-            $descripcion = trim($_POST['descripcion']);
-            $fecha_programada = $_POST['fecha_programada'];
-            $fecha_limite = $_POST['fecha_limite'];
-            $duracion_minutos = $_POST['duracion_minutos'];
-            $nota_maxima = $_POST['nota_maxima'];
-            $tipo = 'examen';
-            $estado = $_POST['estado'] ?? 'programado';
-            
-            // Validaciones
-            if (empty($titulo) || empty($fecha_programada) || empty($fecha_limite)) {
-                throw new Exception('Los campos obligatorios deben estar completos');
+
+        $accion = $_POST['accion'];
+
+        if (in_array($accion, ['cambiar_estado', 'eliminar_examen'], true)) {
+            $id_examen = (int) $_POST['id_examen'];
+
+            // El examen DEBE pertenecer a una asignación de ESTE profesor.
+            // Ni tbl_examen ni tbl_asignacion_docente tienen columna
+            // id_institucion; basta con ad.id_profesor porque $id_profesor
+            // ya viene de una consulta anterior filtrada por tenant.
+            $query = "SELECT e.id FROM tbl_examen e
+                      JOIN tbl_asignacion_docente ad ON e.id_asignacion_docente = ad.id
+                      WHERE e.id = :id AND ad.id_profesor = :prof";
+            $stmt = $db->prepare($query);
+            $stmt->execute([':id' => $id_examen, ':prof' => $id_profesor]);
+            if (!$stmt->fetch()) {
+                throw new Exception('Este examen no le pertenece.');
             }
-            
-            // Obtener período y año de la asignación
-            $query = "SELECT id_periodo, anno FROM tbl_asignacion_docente WHERE id = :id";
-            $stmt = $db->prepare($query);
-            $stmt->execute([':id' => $id_asignacion]);
-            $asignacion = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            // Insertar actividad (examen)
-            $query = "INSERT INTO tbl_actividad (
-                id_asignacion_docente, tipo, titulo, descripcion, 
-                fecha_programada, fecha_limite, duracion_minutos, 
-                nota_maxima, estado
-            ) VALUES (
-                :id_asignacion, :tipo, :titulo, :descripcion,
-                :fecha_programada, :fecha_limite, :duracion,
-                :nota_maxima, :estado
-            )";
-            
-            $stmt = $db->prepare($query);
-            $stmt->execute([
-                ':id_asignacion' => $id_asignacion,
-                ':tipo' => $tipo,
-                ':titulo' => $titulo,
-                ':descripcion' => $descripcion,
-                ':fecha_programada' => $fecha_programada,
-                ':fecha_limite' => $fecha_limite,
-                ':duracion' => $duracion_minutos,
-                ':nota_maxima' => $nota_maxima,
-                ':estado' => $estado
-            ]);
-            
-            $id_examen = $db->lastInsertId();
-            
-            $db->commit();
-            $mensaje = 'Examen asignado exitosamente';
-            $tipo_mensaje = 'success';
+
+            if ($accion == 'cambiar_estado') {
+                $nuevo_estado = $_POST['nuevo_estado'] ?? '';
+                $estados_validos = ['borrador', 'programado', 'activo', 'cerrado'];
+                if (!in_array($nuevo_estado, $estados_validos, true)) {
+                    throw new Exception('Estado no válido.');
+                }
+                $stmt = $db->prepare("UPDATE tbl_examen SET estado = :estado WHERE id = :id");
+                $stmt->execute([':estado' => $nuevo_estado, ':id' => $id_examen]);
+                $mensaje = 'Estado del examen actualizado';
+                $tipo_mensaje = 'success';
+            } else { // eliminar_examen
+                $stmt = $db->prepare("DELETE FROM tbl_opcion_respuesta WHERE id_pregunta IN (SELECT id FROM tbl_pregunta_examen WHERE id_examen = :id)");
+                $stmt->execute([':id' => $id_examen]);
+                $stmt = $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id");
+                $stmt->execute([':id' => $id_examen]);
+                $stmt = $db->prepare("DELETE FROM tbl_examen WHERE id = :id");
+                $stmt->execute([':id' => $id_examen]);
+                $mensaje = 'Examen eliminado';
+                $tipo_mensaje = 'success';
+            }
         }
-        
+
+        $db->commit();
     } catch (Exception $e) {
         $db->rollBack();
         $mensaje = 'Error: ' . $e->getMessage();
@@ -93,7 +87,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
 // ===== OBTENER DATOS PARA EL FORMULARIO =====
 
 // Obtener asignaciones del profesor
-$query = "SELECT 
+$query = "SELECT
     ad.id, ad.anno, ad.id_periodo,
     a.nombre as asignatura, a.codigo,
     s.nombre as seccion, g.nombre as grado
@@ -101,83 +95,61 @@ $query = "SELECT
     JOIN tbl_asignatura a ON ad.id_asignatura = a.id
     JOIN tbl_seccion s ON ad.id_seccion = s.id
     JOIN tbl_grado g ON s.id_grado = g.id
-    WHERE ad.id_profesor = :id_profesor
+    WHERE ad.id_profesor = :id_profesor AND a.id_institucion = :tid
     ORDER BY g.nombre, s.nombre, a.nombre";
 
 $stmt = $db->prepare($query);
-$stmt->execute([':id_profesor' => $id_profesor]);
+$stmt->execute([':id_profesor' => $id_profesor, ':tid' => $tid]);
 $asignaciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Obtener exámenes existentes
-$query = "SELECT 
-    act.id, act.titulo, act.fecha_programada, act.fecha_limite,
-    act.nota_maxima, act.estado,
+// Obtener exámenes existentes (con su contenido real: tbl_examen + preguntas)
+$query = "SELECT
+    ex.id, ex.id_asignacion_docente, ex.titulo, ex.fecha_programada, ex.fecha_limite,
+    ex.nota_maxima, ex.estado,
     a.nombre as asignatura,
     s.nombre as seccion,
-    g.nombre as grado
-    FROM tbl_actividad act
-    JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
+    g.nombre as grado,
+    (SELECT COUNT(*) FROM tbl_pregunta_examen pe WHERE pe.id_examen = ex.id) as total_preguntas
+    FROM tbl_examen ex
+    JOIN tbl_asignacion_docente ad ON ex.id_asignacion_docente = ad.id
     JOIN tbl_asignatura a ON ad.id_asignatura = a.id
     JOIN tbl_seccion s ON ad.id_seccion = s.id
     JOIN tbl_grado g ON s.id_grado = g.id
     WHERE ad.id_profesor = :id_profesor
-    AND act.tipo = 'examen'
-    ORDER BY act.fecha_programada DESC";
+    AND a.id_institucion = :tid
+    ORDER BY ex.created_at DESC";
 
 $stmt = $db->prepare($query);
-$stmt->execute([':id_profesor' => $id_profesor]);
+$stmt->execute([':id_profesor' => $id_profesor, ':tid' => $tid]);
 $examenes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4 => '4to Trimestre'];
+$activePage = 'examen';
+$pageTitle = 'Asignar Examen - Educación Plus';
+ob_start();
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Asignar Examen - Educación Plus</title>
-    
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    
-    <style>
-        :root { --primary: #2c3e50; --sidebar-width: 250px; }
-        body { font-family: 'Segoe UI', sans-serif; background: #f8f9fa; }
-        .sidebar { position: fixed; top: 0; left: 0; height: 100vh; width: var(--sidebar-width); background: var(--primary); color: white; padding-top: 60px; z-index: 1000; }
-        .sidebar .nav-link { color: rgba(255,255,255,0.8); padding: 12px 20px; }
-        .sidebar .nav-link:hover, .sidebar .nav-link.active { color: white; background: rgba(255,255,255,0.1); }
-        .main-content { margin-left: var(--sidebar-width); padding: 20px; }
-        .card-custom { background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); margin-bottom: 20px; }
-        @media (max-width: 768px) { .sidebar { transform: translateX(-100%); } .sidebar.active { transform: translateX(0); } .main-content { margin-left: 0; } }
-    </style>
-</head>
-<body>
-    <!-- Sidebar -->
-    <div class="sidebar" id="sidebar">
-        <div class="text-center mb-4">
-            <h4><i class="fas fa-graduation-cap"></i> Educación Plus</h4>
-            <small>Panel de Profesor</small>
-        </div>
-        <nav class="nav flex-column">
-            <a class="nav-link" href="dashboard_profesor.php"><i class="fas fa-home"></i> Dashboard</a>
-            <a class="nav-link" href="mis_asignaciones.php"><i class="fas fa-book"></i> Mis Asignaciones</a>
-            <a class="nav-link active" href="asignar_examen.php"><i class="fas fa-file-alt"></i> Asignar Examen</a>
-            <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
-            <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
-        </nav>
-    </div>
-
-    <!-- Main Content -->
-    <div class="main-content">
+<style>
+    .card-custom { background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); margin-bottom: 20px; }
+</style>
+<?php
+$extraHead = ob_get_clean();
+require __DIR__ . '/partials/header.php';
+?>
         <!-- Header -->
         <div class="d-flex justify-content-between align-items-center mb-4">
             <div>
                 <h2><i class="fas fa-file-alt"></i> Asignar Examen</h2>
-                <p class="text-muted mb-0">Crear y programar exámenes para tus estudiantes</p>
+                <p class="text-muted mb-0">Crear preguntas y programar exámenes para tus estudiantes</p>
             </div>
-            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalNuevoExamen">
+            <?php if (!empty($asignaciones)): ?>
+            <a href="crear_examen.php" class="btn btn-primary">
+                <i class="fas fa-plus"></i> Nuevo Examen
+            </a>
+            <?php else: ?>
+            <button class="btn btn-primary" disabled title="Necesitas tener al menos una asignación de clase">
                 <i class="fas fa-plus"></i> Nuevo Examen
             </button>
+            <?php endif; ?>
         </div>
 
         <!-- Mensajes -->
@@ -226,9 +198,13 @@ $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4
                 <div class="text-center py-5 text-muted">
                     <i class="fas fa-inbox fa-3x mb-3"></i>
                     <p>No hay exámenes asignados todavía.</p>
-                    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalNuevoExamen">
+                    <?php if (!empty($asignaciones)): ?>
+                    <a href="crear_examen.php" class="btn btn-primary">
                         <i class="fas fa-plus"></i> Crear Primer Examen
-                    </button>
+                    </a>
+                    <?php else: ?>
+                    <p class="small">Necesitas tener al menos una asignación de clase para crear un examen.</p>
+                    <?php endif; ?>
                 </div>
                 <?php else: ?>
                 <div class="table-responsive">
@@ -238,6 +214,7 @@ $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4
                                 <th>Examen</th>
                                 <th>Asignatura</th>
                                 <th>Grado/Sección</th>
+                                <th>Preguntas</th>
                                 <th>Fecha Programada</th>
                                 <th>Fecha Límite</th>
                                 <th>Nota Máx.</th>
@@ -253,28 +230,63 @@ $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4
                                 </td>
                                 <td><?= htmlspecialchars($examen['asignatura']) ?></td>
                                 <td>
-                                    <?= htmlspecialchars($examen['grado']) ?> - 
+                                    <?= htmlspecialchars($examen['grado']) ?> -
                                     <?= htmlspecialchars($examen['seccion']) ?>
                                 </td>
-                                <td><?= date('d/m/Y H:i', strtotime($examen['fecha_programada'])) ?></td>
-                                <td><?= date('d/m/Y H:i', strtotime($examen['fecha_limite'])) ?></td>
+                                <td>
+                                    <span class="badge bg-<?= $examen['total_preguntas'] > 0 ? 'secondary' : 'danger' ?>">
+                                        <?= (int) $examen['total_preguntas'] ?>
+                                    </span>
+                                </td>
+                                <td><?= $examen['fecha_programada'] ? date('d/m/Y H:i', strtotime($examen['fecha_programada'])) : '—' ?></td>
+                                <td><?= $examen['fecha_limite'] ? date('d/m/Y H:i', strtotime($examen['fecha_limite'])) : '—' ?></td>
                                 <td><span class="badge bg-info"><?= $examen['nota_maxima'] ?></span></td>
                                 <td>
-                                    <span class="badge bg-<?= $examen['estado'] == 'activo' ? 'success' : ($examen['estado'] == 'programado' ? 'warning' : 'secondary') ?>">
+                                    <span class="badge bg-<?= $examen['estado'] == 'activo' ? 'success' : ($examen['estado'] == 'programado' ? 'warning' : ($examen['estado'] == 'cerrado' ? 'dark' : 'secondary')) ?>">
                                         <?= ucfirst($examen['estado']) ?>
                                     </span>
                                 </td>
                                 <td>
                                     <div class="btn-group btn-group-sm">
-                                        <button class="btn btn-info" title="Ver">
-                                            <i class="fas fa-eye"></i>
-                                        </button>
-                                        <button class="btn btn-warning" title="Editar">
+                                        <a class="btn btn-warning" title="Editar preguntas y configuración"
+                                           href="crear_examen.php?asignacion=<?= $examen['id_asignacion_docente'] ?>&examen=<?= $examen['id'] ?>">
                                             <i class="fas fa-edit"></i>
-                                        </button>
-                                        <button class="btn btn-danger" title="Eliminar">
-                                            <i class="fas fa-trash"></i>
-                                        </button>
+                                        </a>
+                                        <?php if ($examen['estado'] === 'borrador'): ?>
+                                        <form method="POST" class="d-inline" onsubmit="return confirm('¿Publicar este examen para que quede visible como Programado?');">
+                                            <input type="hidden" name="accion" value="cambiar_estado">
+                                            <input type="hidden" name="id_examen" value="<?= $examen['id'] ?>">
+                                            <input type="hidden" name="nuevo_estado" value="programado">
+                                            <button type="submit" class="btn btn-success" title="Publicar"<?= $examen['total_preguntas'] == 0 ? ' disabled' : '' ?>>
+                                                <i class="fas fa-check"></i>
+                                            </button>
+                                        </form>
+                                        <?php elseif ($examen['estado'] === 'programado'): ?>
+                                        <form method="POST" class="d-inline">
+                                            <input type="hidden" name="accion" value="cambiar_estado">
+                                            <input type="hidden" name="id_examen" value="<?= $examen['id'] ?>">
+                                            <input type="hidden" name="nuevo_estado" value="activo">
+                                            <button type="submit" class="btn btn-info" title="Activar">
+                                                <i class="fas fa-play"></i>
+                                            </button>
+                                        </form>
+                                        <?php elseif ($examen['estado'] === 'activo'): ?>
+                                        <form method="POST" class="d-inline">
+                                            <input type="hidden" name="accion" value="cambiar_estado">
+                                            <input type="hidden" name="id_examen" value="<?= $examen['id'] ?>">
+                                            <input type="hidden" name="nuevo_estado" value="cerrado">
+                                            <button type="submit" class="btn btn-secondary" title="Cerrar">
+                                                <i class="fas fa-lock"></i>
+                                            </button>
+                                        </form>
+                                        <?php endif; ?>
+                                        <form method="POST" class="d-inline" onsubmit="return confirm('¿Eliminar este examen y todas sus preguntas? Esta acción no se puede deshacer.');">
+                                            <input type="hidden" name="accion" value="eliminar_examen">
+                                            <input type="hidden" name="id_examen" value="<?= $examen['id'] ?>">
+                                            <button type="submit" class="btn btn-danger" title="Eliminar">
+                                                <i class="fas fa-trash"></i>
+                                            </button>
+                                        </form>
                                     </div>
                                 </td>
                             </tr>
@@ -287,83 +299,7 @@ $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4
         </div>
     </div>
 
-    <!-- Modal Nuevo Examen -->
-    <div class="modal fade" id="modalNuevoExamen" tabindex="-1">
-        <div class="modal-dialog modal-lg">
-            <div class="modal-content">
-                <div class="modal-header bg-primary text-white">
-                    <h5 class="modal-title"><i class="fas fa-file-alt"></i> Asignar Nuevo Examen</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                </div>
-                <form method="POST">
-                    <div class="modal-body">
-                        <input type="hidden" name="accion" value="crear_examen">
-                        
-                        <div class="row g-3">
-                            <div class="col-md-6">
-                                <label class="form-label">Asignatura *</label>
-                                <select name="id_asignacion" class="form-select" required>
-                                    <option value="">Seleccionar asignatura</option>
-                                    <?php foreach ($asignaciones as $asig): ?>
-                                    <option value="<?= $asig['id'] ?>">
-                                        <?= htmlspecialchars($asig['asignatura']) ?> - 
-                                        <?= htmlspecialchars($asig['grado']) ?> <?= htmlspecialchars($asig['seccion']) ?>
-                                    </option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label">Título del Examen *</label>
-                                <input type="text" name="titulo" class="form-control" required 
-                                       placeholder="Ej: Examen Parcial Unidad 1">
-                            </div>
-                            <div class="col-12">
-                                <label class="form-label">Descripción</label>
-                                <textarea name="descripcion" class="form-control" rows="3" 
-                                          placeholder="Instrucciones, temas a evaluar, etc."></textarea>
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label">Fecha de Programación *</label>
-                                <input type="datetime-local" name="fecha_programada" class="form-control" required>
-                                <small class="text-muted">Cuándo estará disponible el examen</small>
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label">Fecha Límite de Entrega *</label>
-                                <input type="datetime-local" name="fecha_limite" class="form-control" required>
-                                <small class="text-muted">Fecha y hora límite para entregar</small>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">Duración (minutos)</label>
-                                <input type="number" name="duracion_minutos" class="form-control" 
-                                       placeholder="60" min="1">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">Nota Máxima *</label>
-                                <input type="number" name="nota_maxima" class="form-control" 
-                                       value="10" step="0.1" min="0" max="100" required>
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label">Estado</label>
-                                <select name="estado" class="form-select">
-                                    <option value="programado">Programado</option>
-                                    <option value="activo">Activo</option>
-                                    <option value="cerrado">Cerrado</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fas fa-save"></i> Asignar Examen
-                        </button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <?php require __DIR__ . '/partials/scripts.php'; ?>
     <script>
         // Toggle sidebar en móvil
         document.getElementById('sidebar')?.addEventListener('click', (e) => {

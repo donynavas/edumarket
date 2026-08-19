@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // ========================================
 // CONFIGURACIÓN Y VALIDACIÓN INICIAL
@@ -21,15 +22,17 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // ========================================
 // OBTENER ID DEL PROFESOR
 // ========================================
 $query = "SELECT p.id as id_profesor FROM tbl_profesor p
           JOIN tbl_persona per ON p.id_persona = per.id
-          WHERE per.id_usuario = :user_id";
+          WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $profesor = $stmt->fetch(PDO::FETCH_ASSOC);
 $id_profesor = $profesor['id_profesor'] ?? 0;
@@ -85,10 +88,12 @@ if (!in_array($estado, $estados_validos)) {
 if ($id_asignacion <= 0) {
     $errors[] = "Asignación no válida";
 } else {
-    // Verificar que la asignación existe y pertenece al profesor
-    $query = "SELECT id FROM tbl_asignacion_docente 
-              WHERE id = :id_asignacion 
-              AND id_profesor = :id_profesor 
+    // Verificar que la asignación existe y pertenece al profesor.
+    // tbl_asignacion_docente no tiene columna id_institucion; id_profesor
+    // ya está tenant-verificado (resuelto arriba vía p.id_institucion).
+    $query = "SELECT id FROM tbl_asignacion_docente
+              WHERE id = :id_asignacion
+              AND id_profesor = :id_profesor
               LIMIT 1";
     $stmt = $db->prepare($query);
     $stmt->execute([
@@ -107,9 +112,11 @@ if ($modo === 'editar' && empty($errors)) {
     if ($id_actividad <= 0) {
         $errors[] = "ID de actividad no válido";
     } else {
-        $query = "SELECT id FROM tbl_actividad 
-                  WHERE id = :id_actividad 
-                  AND id_asignacion_docente = :id_asignacion 
+        // tbl_actividad no tiene columna id_institucion; id_asignacion ya
+        // se verificó como propio del profesor arriba.
+        $query = "SELECT id FROM tbl_actividad
+                  WHERE id = :id_actividad
+                  AND id_asignacion_docente = :id_asignacion
                   LIMIT 1";
         $stmt = $db->prepare($query);
         $stmt->execute([
@@ -134,22 +141,31 @@ if (empty($errors)) {
             // ========================================
             // INSERT - CREAR NUEVA ACTIVIDAD
             // ========================================
+            // tbl_actividad no tiene columna id_institucion (se confirmó
+            // contra el esquema real) — insertarla aquí bloqueaba TODA
+            // creación de actividad/examen desde el tablón del profesor.
+            // tbl_actividad.duracion_minutos es TIME en el esquema real (no
+            // INT); se convierte con SEC_TO_TIME desde los minutos del form.
             $query = "INSERT INTO tbl_actividad (
                         titulo, descripcion, tipo, contenido, url_recurso,
-                        fecha_programada, fecha_limite, duracion_minutos, 
+                        fecha_programada, fecha_limite, duracion_minutos,
                         nota_maxima, estado, id_asignacion_docente
                     ) VALUES (
                         :titulo, :descripcion, :tipo, :contenido, :url_recurso,
-                        :fecha_programada, :fecha_limite, :duracion_minutos, 
+                        :fecha_programada, :fecha_limite, SEC_TO_TIME(:duracion_minutos * 60),
                         :nota_maxima, :estado, :id_asignacion_docente
                     )";
-            
+
             $stmt = $db->prepare($query);
             $stmt->execute([
                 ':titulo' => $titulo,
                 ':descripcion' => $descripcion,
                 ':tipo' => $tipo,
-                ':contenido' => !empty($contenido) ? $contenido : null,
+                // tbl_actividad.contenido es NOT NULL sin default; el
+                // formulario no siempre lo captura, así que se completa con
+                // la descripción para que el INSERT no falle (mismo patrón
+                // usado en gestionar_examenes.php).
+                ':contenido' => !empty($contenido) ? $contenido : $descripcion,
                 ':url_recurso' => !empty($url_recurso) ? $url_recurso : null,
                 ':fecha_programada' => $fecha_programada,
                 ':fecha_limite' => $fecha_limite,
@@ -180,11 +196,12 @@ if (empty($errors)) {
             $estudiantes = $stmt_est->fetchAll(PDO::FETCH_ASSOC);
             
             if (!empty($estudiantes)) {
-                $query_entrega = "INSERT INTO tbl_entrega_actividad 
-                                  (id_actividad, id_estudiante, estado_entrega) 
+                // tbl_entrega_actividad tampoco tiene columna id_institucion.
+                $query_entrega = "INSERT INTO tbl_entrega_actividad
+                                  (id_actividad, id_estudiante, estado_entrega)
                                   VALUES (:id_actividad, :id_estudiante, 'pendiente')";
                 $stmt_entrega = $db->prepare($query_entrega);
-                
+
                 foreach ($estudiantes as $estudiante) {
                     $stmt_entrega->execute([
                         ':id_actividad' => $nuevo_id,
@@ -210,18 +227,19 @@ if (empty($errors)) {
                         url_recurso = :url_recurso,
                         fecha_programada = :fecha_programada,
                         fecha_limite = :fecha_limite,
-                        duracion_minutos = :duracion_minutos,
+                        duracion_minutos = SEC_TO_TIME(:duracion_minutos * 60),
                         nota_maxima = :nota_maxima,
                         estado = :estado
-                    WHERE id = :id_actividad 
+                    WHERE id = :id_actividad
                     AND id_asignacion_docente = :id_asignacion";
-            
+
             $stmt = $db->prepare($query);
             $stmt->execute([
                 ':titulo' => $titulo,
                 ':descripcion' => $descripcion,
                 ':tipo' => $tipo,
-                ':contenido' => !empty($contenido) ? $contenido : null,
+                // contenido es NOT NULL sin default; ver nota en el INSERT arriba.
+                ':contenido' => !empty($contenido) ? $contenido : $descripcion,
                 ':url_recurso' => !empty($url_recurso) ? $url_recurso : null,
                 ':fecha_programada' => $fecha_programada,
                 ':fecha_limite' => $fecha_limite,

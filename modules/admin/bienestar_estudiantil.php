@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'director', 'orientador'])) {
@@ -10,6 +11,7 @@ if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'direc
 
 $database = new Database();
 $db = $database->getConnection();
+$tid = TenantGuard::id();
 $mensaje = '';
 $tipo_mensaje = '';
 
@@ -21,8 +23,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $db->beginTransaction();
         
         if ($accion === 'crear_seguimiento') {
-            $query = "INSERT INTO tbl_bienestar_seguimiento 
-                      (id_estudiante, id_orientador, fecha_inicio, motivo, descripcion, estado, prioridad) 
+            TenantGuard::assertOwner($db, 'tbl_estudiante', (int) $_POST['id_estudiante']);
+
+            // tbl_bienestar_seguimiento no tiene columna id_institucion (se
+            // confirmó contra el esquema real) — insertarla aquí bloqueaba
+            // TODO seguimiento nuevo. El estudiante ya se verificó arriba.
+            $query = "INSERT INTO tbl_bienestar_seguimiento
+                      (id_estudiante, id_orientador, fecha_inicio, motivo, descripcion, estado, prioridad)
                       VALUES (:estudiante, :orientador, :fecha, :motivo, :descripcion, :estado, :prioridad)";
             $stmt = $db->prepare($query);
             $stmt->execute([
@@ -36,10 +43,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             $mensaje = 'Seguimiento creado exitosamente';
             $tipo_mensaje = 'success';
-            
+
         } elseif ($accion === 'actualizar_seguimiento') {
-            $query = "UPDATE tbl_bienestar_seguimiento SET 
-                      fecha_inicio = :fecha, motivo = :motivo, descripcion = :descripcion, 
+            TenantGuard::assertOwner($db, 'tbl_bienestar_seguimiento', (int) $_POST['id_seguimiento']);
+
+            // tbl_bienestar_seguimiento no tiene columna id_institucion;
+            // ya se verificó como propio arriba con assertOwner().
+            $query = "UPDATE tbl_bienestar_seguimiento SET
+                      fecha_inicio = :fecha, motivo = :motivo, descripcion = :descripcion,
                       estado = :estado, prioridad = :prioridad, observaciones = :observaciones
                       WHERE id = :id";
             $stmt = $db->prepare($query);
@@ -54,17 +65,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             $mensaje = 'Seguimiento actualizado';
             $tipo_mensaje = 'success';
-            
+
         } elseif ($accion === 'cerrar_seguimiento') {
-            $stmt = $db->prepare("UPDATE tbl_bienestar_seguimiento 
+            TenantGuard::assertOwner($db, 'tbl_bienestar_seguimiento', (int) $_POST['id_seguimiento']);
+
+            $stmt = $db->prepare("UPDATE tbl_bienestar_seguimiento
                                   SET estado = 'cerrado', fecha_cierre = NOW() WHERE id = :id");
             $stmt->execute([':id' => $_POST['id_seguimiento']]);
             $mensaje = 'Seguimiento cerrado';
             $tipo_mensaje = 'info';
-            
+
         } elseif ($accion === 'crear_sesion') {
-            $query = "INSERT INTO tbl_bienestar_sesion 
-                      (id_seguimiento, fecha, tipo, duracion_min, descripcion, acuerdos, proxima_sesion) 
+            TenantGuard::assertOwner($db, 'tbl_bienestar_seguimiento', (int) $_POST['id_seguimiento']);
+
+            // tbl_bienestar_sesion no tiene columna id_institucion;
+            // id_seguimiento ya se verificó arriba con assertOwner().
+            $query = "INSERT INTO tbl_bienestar_sesion
+                      (id_seguimiento, fecha, tipo, duracion_min, descripcion, acuerdos, proxima_sesion)
                       VALUES (:seguimiento, :fecha, :tipo, :duracion, :descripcion, :acuerdos, :proxima)";
             $stmt = $db->prepare($query);
             $stmt->execute([
@@ -78,8 +95,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             $mensaje = 'Sesión registrada';
             $tipo_mensaje = 'success';
-            
+
         } elseif ($accion === 'derivar_alerta') {
+            TenantGuard::assertOwner($db, 'tbl_bienestar_alerta', (int) $_POST['id_alerta']);
+            if (!empty($_POST['id_seguimiento'])) {
+                TenantGuard::assertOwner($db, 'tbl_bienestar_seguimiento', (int) $_POST['id_seguimiento']);
+            }
+
+            // tbl_bienestar_alerta no tiene columna id_institucion; ya se
+            // verificó como propia arriba con assertOwner().
             $stmt = $db->prepare("UPDATE tbl_bienestar_alerta SET atendida = 1, id_seguimiento = :seg WHERE id = :id");
             $stmt->execute([':seg' => $_POST['id_seguimiento'], ':id' => $_POST['id_alerta']]);
             $mensaje = 'Alerta derivada a seguimiento';
@@ -122,9 +146,9 @@ $query = "SELECT s.*,
           JOIN tbl_grado g ON sec.id_grado = g.id
           JOIN tbl_usuario u ON s.id_orientador = u.id
           LEFT JOIN tbl_bienestar_sesion ses ON s.id = ses.id_seguimiento
-          WHERE 1=1";
+          WHERE e.id_institucion = :tid";
 
-$params = [];
+$params = [':tid' => $tid];
 
 if (!empty($filtros['estado'])) {
     $query .= " AND s.estado = :estado";
@@ -149,22 +173,28 @@ $stmt->execute();
 $seguimientos = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Alertas pendientes
-$alertas = $db->query("SELECT a.*, CONCAT(p.primer_nombre, ' ', p.primer_apellido) as estudiante, a.tipo
+$stmt_alertas = $db->prepare("SELECT a.*, CONCAT(p.primer_nombre, ' ', p.primer_apellido) as estudiante, a.tipo
                        FROM tbl_bienestar_alerta a
                        JOIN tbl_estudiante e ON a.id_estudiante = e.id
                        JOIN tbl_persona p ON e.id_persona = p.id
-                       WHERE a.atendida = 0
-                       ORDER BY a.fecha DESC")->fetchAll(PDO::FETCH_ASSOC);
+                       WHERE a.atendida = 0 AND e.id_institucion = :tid
+                       ORDER BY a.fecha DESC");
+$stmt_alertas->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt_alertas->execute();
+$alertas = $stmt_alertas->fetchAll(PDO::FETCH_ASSOC);
 
 // Reportes docentes pendientes
-$reportes = $db->query("SELECT r.*, CONCAT(p.primer_nombre, ' ', p.primer_apellido) as estudiante, 
+$stmt_reportes = $db->prepare("SELECT r.*, CONCAT(p.primer_nombre, ' ', p.primer_apellido) as estudiante,
                                u.usuario as docente
                         FROM tbl_bienestar_reporte_docente r
                         JOIN tbl_estudiante e ON r.id_estudiante = e.id
                         JOIN tbl_persona p ON e.id_persona = p.id
                         JOIN tbl_usuario u ON r.id_docente = u.id
-                        WHERE r.atendido = 0
-                        ORDER BY r.fecha DESC")->fetchAll(PDO::FETCH_ASSOC);
+                        WHERE r.atendido = 0 AND e.id_institucion = :tid
+                        ORDER BY r.fecha DESC");
+$stmt_reportes->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt_reportes->execute();
+$reportes = $stmt_reportes->fetchAll(PDO::FETCH_ASSOC);
 
 // Datos auxiliares
 $motivos = ['academico' => 'Académico', 'conductual' => 'Conductual', 'emocional' => 'Emocional', 
@@ -174,11 +204,14 @@ $prioridades = ['alta' => 'Alta', 'media' => 'Media', 'baja' => 'Baja'];
 $tipos_sesion = ['individual' => 'Individual', 'grupal' => 'Grupal', 'familiar' => 'Familiar', 
                  'telefonica' => 'Telefónica', 'virtual' => 'Virtual'];
 
-$estudiantes = $db->query("SELECT e.id, CONCAT(p.primer_nombre, ' ', p.primer_apellido) as nombre, e.nie
+$stmt_est = $db->prepare("SELECT e.id, CONCAT(p.primer_nombre, ' ', p.primer_apellido) as nombre, e.nie
                            FROM tbl_estudiante e
                            JOIN tbl_persona p ON e.id_persona = p.id
                            JOIN tbl_usuario u ON p.id_usuario = u.id
-                           WHERE u.estado = 1 ORDER BY p.primer_apellido")->fetchAll(PDO::FETCH_ASSOC);
+                           WHERE u.estado = 1 AND e.id_institucion = :tid ORDER BY p.primer_apellido");
+$stmt_est->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt_est->execute();
+$estudiantes = $stmt_est->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="es">

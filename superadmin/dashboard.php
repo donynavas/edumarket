@@ -42,7 +42,7 @@ $total_usuarios = $db->query("SELECT COUNT(*) FROM tbl_usuario")->fetchColumn();
                 <a href="dashboard.php" class="active"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
                 <a href="instituciones.php"><i class="fas fa-university"></i> Instituciones</a>
                 <a href="usuarios.php"><i class="fas fa-users-cog"></i> Usuarios Globales</a>
-                <a href="../login.php" class="text-danger"><i class="fas fa-sign-out-alt"></i> Salir al Login</a>
+                <a href="logout.php" class="text-danger"><i class="fas fa-sign-out-alt"></i> Salir al Login</a>
             </div>
 
             <!-- Content -->

@@ -8,6 +8,7 @@
 session_start();
 header('Content-Type: application/json');
 require_once __DIR__ . '/../../../config/database.php';
+require_once __DIR__ . '/../../../config/TenantGuard.php';
 
 if (!isset($_SESSION['user_id'])) {
     echo json_encode([
@@ -17,6 +18,7 @@ if (!isset($_SESSION['user_id'])) {
     exit;
 }
 
+$tid = TenantGuard::id();
 $id_estudiante = $_GET['id_estudiante'] ?? 0;
 $id_leccion = $_GET['id_leccion'] ?? null;
 
@@ -31,7 +33,8 @@ if (!$id_estudiante) {
 try {
     $database = new Database();
     $db = $database->getConnection();
-    
+    TenantGuard::assertOwner($db, 'tbl_estudiante', (int)$id_estudiante);
+
     // Progreso general
     $query = "SELECT 
               COUNT(*) as total_lecciones,

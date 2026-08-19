@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'profesor') {
     header("Location: " . BASE_URL . "/login.php");
@@ -10,11 +11,15 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'profesor') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener ID del profesor
-$stmt = $db->prepare("SELECT id FROM tbl_profesor WHERE id_persona = (SELECT id_persona FROM tbl_usuario WHERE id = :uid)");
-$stmt->execute([':uid' => $user_id]);
-$id_profesor = $stmt->fetchColumn() ?: 0;
+$stmt = $db->prepare("SELECT p.id, per.primer_nombre FROM tbl_profesor p
+                      JOIN tbl_persona per ON p.id_persona = per.id
+                      WHERE per.id_usuario = :uid AND p.id_institucion = :tid");
+$stmt->execute([':uid' => $user_id, ':tid' => $tid]);
+$profesor = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
+$id_profesor = $profesor['id'] ?? 0;
 
 // Obtener asignaciones del profesor
 $stmt = $db->prepare("SELECT ad.id, asig.nombre as asignatura, CONCAT(g.nombre, ' - ', s.nombre) as clase
@@ -22,9 +27,9 @@ $stmt = $db->prepare("SELECT ad.id, asig.nombre as asignatura, CONCAT(g.nombre, 
                       JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
                       JOIN tbl_seccion s ON ad.id_seccion = s.id
                       JOIN tbl_grado g ON s.id_grado = g.id
-                      WHERE ad.id_profesor = :prof
+                      WHERE ad.id_profesor = :prof AND asig.id_institucion = :tid
                       ORDER BY asig.nombre");
-$stmt->execute([':prof' => $id_profesor]);
+$stmt->execute([':prof' => $id_profesor, ':tid' => $tid]);
 $asignaciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $id_asignacion = $_GET['asignacion'] ?? ($asignaciones[0]['id'] ?? 0);
@@ -34,12 +39,17 @@ $examen_id = $_GET['examen'] ?? 0;
 $examen = null;
 $preguntas = [];
 if ($examen_id) {
-    $stmt = $db->prepare("SELECT * FROM tbl_examen WHERE id = :id AND id_asignacion_docente = :asig");
-    $stmt->execute([':id' => $examen_id, ':asig' => $id_asignacion]);
+    // tbl_examen no tiene columna id_institucion; se verifica que el examen
+    // pertenezca a la asignación indicada Y que esa asignación sea del
+    // profesor de la sesión (antes no se comprobaba lo segundo).
+    $stmt = $db->prepare("SELECT e.* FROM tbl_examen e
+                          JOIN tbl_asignacion_docente ad ON e.id_asignacion_docente = ad.id
+                          WHERE e.id = :id AND e.id_asignacion_docente = :asig AND ad.id_profesor = :prof");
+    $stmt->execute([':id' => $examen_id, ':asig' => $id_asignacion, ':prof' => $id_profesor]);
     $examen = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if ($examen) {
-        $stmt = $db->prepare("SELECT p.*, GROUP_CONCAT(CONCAT(o.id,':',o.texto,':',o.es_correcta) SEPARATOR '|') as opciones
+        $stmt = $db->prepare("SELECT p.*, GROUP_CONCAT(CONCAT(o.id,':',o.texto,':',o.es_correcta,':',o.orden) ORDER BY o.orden SEPARATOR '|') as opciones
                               FROM tbl_pregunta_examen p
                               LEFT JOIN tbl_opcion_respuesta o ON p.id = o.id_pregunta
                               WHERE p.id_examen = :id
@@ -49,43 +59,39 @@ if ($examen_id) {
         $preguntas = $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 }
+$activePage = 'examen';
+$pageTitle = 'Crear Examen - Educación Plus';
+ob_start();
 ?>
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crear Examen - Educación Plus</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <style>
-        :root { --primary: #2c3e50; --secondary: #3498db; }
-        body { font-family: 'Segoe UI', sans-serif; background: #f5f7fa; }
-        .question-card { border-left: 4px solid var(--secondary); background: white; border-radius: 8px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
-        .option-item { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; padding: 8px; background: #f8f9fa; border-radius: 6px; }
-        .option-item.correct { background: #d4edda; border: 1px solid #c3e6cb; }
-        .question-type-selector { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
-        .type-btn { padding: 10px 20px; border: 2px solid #ddd; border-radius: 8px; cursor: pointer; transition: all 0.2s; background: white; }
-        .type-btn:hover, .type-btn.active { border-color: var(--secondary); background: #e8f4fd; }
-        .type-btn i { margin-right: 8px; }
-        .preview-container { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
-        .timer-display { font-size: 1.5rem; font-weight: bold; color: var(--secondary); }
-    </style>
-</head>
-<body>
-    <nav class="navbar navbar-dark bg-dark px-4">
+<style>
+    .question-card { border-left: 4px solid var(--secondary); background: white; border-radius: 8px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+    .option-item { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; padding: 8px; background: #f8f9fa; border-radius: 6px; }
+    .option-item.correct { background: #d4edda; border: 1px solid #c3e6cb; }
+    .question-type-selector { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+    .type-btn { padding: 10px 20px; border: 2px solid #ddd; border-radius: 8px; cursor: pointer; transition: all 0.2s; background: white; }
+    .type-btn:hover, .type-btn.active { border-color: var(--secondary); background: #e8f4fd; }
+    .type-btn i { margin-right: 8px; }
+    .preview-container { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+    .timer-display { font-size: 1.5rem; font-weight: bold; color: var(--secondary); }
+    .editor-topbar { background: var(--primary); color: white; border-radius: 10px; padding: 14px 20px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; }
+</style>
+<?php
+$extraHead = ob_get_clean();
+require __DIR__ . '/partials/header.php';
+?>
+    <div class="editor-topbar">
         <div class="d-flex align-items-center">
             <i class="fas fa-file-alt fa-lg me-2"></i>
             <h5 class="mb-0">Editor de Exámenes</h5>
         </div>
         <div>
-            <a href="aula_virtual.php?asignacion=<?= $id_asignacion ?>" class="btn btn-outline-light btn-sm">
-                <i class="fas fa-arrow-left"></i> Volver al Aula
+            <a href="asignar_examen.php" class="btn btn-outline-light btn-sm">
+                <i class="fas fa-arrow-left"></i> Volver
             </a>
         </div>
-    </nav>
+    </div>
 
-    <div class="container-fluid p-4">
+    <div class="container-fluid p-0">
         <div class="row">
             <!-- Left: Editor -->
             <div class="col-lg-8">
@@ -233,7 +239,7 @@ if ($examen_id) {
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <?php require __DIR__ . '/partials/scripts.php'; ?>
     <script>
         let preguntaCounter = <?= count($preguntas) ?>;
         
@@ -490,6 +496,7 @@ if ($examen_id) {
             }
         });
     </script>
+    </div>
 </body>
 </html>
 
@@ -500,8 +507,12 @@ function renderPregunta($preg, $numero) {
     if ($preg['opciones']) {
         $opts = explode('|', $preg['opciones']);
         foreach ($opts as $opt) {
-            list($id, $texto, $correcta) = explode(':', $opt);
-            $opciones[] = ['id' => $id, 'texto' => $texto, 'correcta' => $correcta];
+            $partes = explode(':', $opt);
+            $id = $partes[0] ?? '';
+            $texto = $partes[1] ?? '';
+            $correcta = $partes[2] ?? 0;
+            $orden = $partes[3] ?? 0;
+            $opciones[] = ['id' => $id, 'texto' => $texto, 'correcta' => $correcta, 'orden' => $orden];
         }
     }
     
@@ -527,8 +538,12 @@ function renderPregunta($preg, $numero) {
     
     // Enunciado
     $html .= '<div class="mb-3"><label class="form-label">Enunciado *</label>';
-    $html .= '<textarea name="pregunta['.$numero.'][enunciado]" class="form-control" rows="2" required>'.htmlspecialchars($preg['enunciado']).'</textarea></div>';
-    
+    $html .= '<textarea name="pregunta['.$numero.'][enunciado]" class="form-control" rows="2" required>'.htmlspecialchars($preg['enunciado']).'</textarea>';
+    if ($preg['tipo'] === 'completar') {
+        $html .= '<small class="text-muted">Usa [corchetes] para indicar la respuesta correcta</small>';
+    }
+    $html .= '</div>';
+
     // Campos según tipo
     if ($preg['tipo'] === 'opcion_multiple') {
         $html .= '<div class="mb-3"><label class="form-label">Opciones de Respuesta</label><div id="opciones-'.$numero.'">';
@@ -546,8 +561,32 @@ function renderPregunta($preg, $numero) {
         $html .= '<div class="mb-3"><label class="form-label">Respuesta Correcta</label>';
         $html .= '<div class="form-check"><input class="form-check-input" type="radio" name="pregunta['.$numero.'][correcta]" value="V" '.($opciones[0]['correcta'] ? 'checked' : '').'><label class="form-check-label">Verdadero</label></div>';
         $html .= '<div class="form-check"><input class="form-check-input" type="radio" name="pregunta['.$numero.'][correcta]" value="F" '.(!$opciones[0]['correcta'] ? 'checked' : '').'><label class="form-check-label">Falso</label></div></div>';
+    } elseif ($preg['tipo'] === 'respuesta_corta') {
+        $respuesta = $opciones[0]['texto'] ?? '';
+        $html .= '<div class="mb-3"><label class="form-label">Respuesta Correcta *</label>';
+        $html .= '<input type="text" name="pregunta['.$numero.'][correcta]" class="form-control" value="'.htmlspecialchars($respuesta).'" required>';
+        $html .= '<small class="text-muted">Se aceptarán variaciones de mayúsculas/minúsculas</small></div>';
+    } elseif ($preg['tipo'] === 'relacionar') {
+        // Las opciones se guardaron primero todas las de la izquierda (es_correcta=0)
+        // y luego todas las de la derecha (es_correcta=1), en el mismo orden de emparejamiento.
+        $izquierda = array_values(array_filter($opciones, fn($o) => !$o['correcta']));
+        $derecha = array_values(array_filter($opciones, fn($o) => $o['correcta']));
+        $pares = max(count($izquierda), count($derecha));
+
+        $html .= '<div id="relaciones-'.$numero.'">';
+        for ($i = 0; $i < $pares; $i++) {
+            $val_izq = htmlspecialchars($izquierda[$i]['texto'] ?? '');
+            $val_der = htmlspecialchars($derecha[$i]['texto'] ?? '');
+            $html .= '<div class="row g-2 mb-2">';
+            $html .= '<div class="col-5"><input type="text" name="pregunta['.$numero.'][izquierda][]" class="form-control" value="'.$val_izq.'" placeholder="Elemento A" required></div>';
+            $html .= '<div class="col-2 text-center"><i class="fas fa-arrows-alt-h text-muted"></i></div>';
+            $html .= '<div class="col-5"><input type="text" name="pregunta['.$numero.'][derecha][]" class="form-control" value="'.$val_der.'" placeholder="Correspondencia" required></div>';
+            $html .= '</div>';
+        }
+        $html .= '</div>';
+        $html .= '<button type="button" class="btn btn-sm btn-outline-primary mt-2" onclick="agregarRelacion('.$numero.')"><i class="fas fa-plus"></i> Agregar Par</button>';
     }
-    
+
     $html .= '</div>';
     return $html;
 }

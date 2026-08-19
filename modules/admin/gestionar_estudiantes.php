@@ -8,6 +8,8 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['r
     exit;
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
@@ -49,23 +51,28 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $password_hash = password_hash($password, PASSWORD_DEFAULT);
             $rol_usuario = 'estudiante';
             $email_usuario = $_POST['email'] ?? '';
-            
-            $query = "INSERT INTO tbl_usuario (nombre, usuario, password, email, rol, estado) 
-                      VALUES (:nombre, :usuario, :password, :email, :rol, 1)";
+
+            $query = "INSERT INTO tbl_usuario (nombre, usuario, password, email, rol, estado, id_institucion)
+                      VALUES (:nombre, :usuario, :password, :email, :rol, 1, :tid)";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':nombre', $_POST['primer_nombre'] . ' ' . $_POST['primer_apellido'], PDO::PARAM_STR);
             $stmt->bindValue(':usuario', $usuario, PDO::PARAM_STR);
             $stmt->bindValue(':password', $password_hash, PDO::PARAM_STR);
             $stmt->bindValue(':email', $email_usuario, PDO::PARAM_STR);
             $stmt->bindValue(':rol', $rol_usuario, PDO::PARAM_STR);
+            $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
             $stmt->execute();
             $id_usuario = $db->lastInsertId();
-            
-            $query = "INSERT INTO tbl_persona (primer_nombre, segundo_nombre, tercer_nombre, 
-                      primer_apellido, segundo_apellido, dui, fecha_nacimiento, sexo, 
-                      nacionalidad, direccion, telefono_fijo, celular, email, id_usuario) 
-                      VALUES (:p_nombre, :s_nombre, :t_nombre, :p_apellido, :s_apellido, 
-                              :dui, :fecha_nac, :sexo, :nacionalidad, :direccion, 
+
+            // tbl_persona no tiene columna id_institucion (se confirmó
+            // contra el esquema real) — insertarla aquí bloqueaba TODA
+            // creación de estudiante nuevo (la transacción completa hacía
+            // rollback tras el fallo de este INSERT).
+            $query = "INSERT INTO tbl_persona (primer_nombre, segundo_nombre, tercer_nombre,
+                      primer_apellido, segundo_apellido, dui, fecha_nacimiento, sexo,
+                      nacionalidad, direccion, telefono_fijo, celular, email, id_usuario)
+                      VALUES (:p_nombre, :s_nombre, :t_nombre, :p_apellido, :s_apellido,
+                              :dui, :fecha_nac, :sexo, :nacionalidad, :direccion,
                               :tel_fijo, :celular, :email, :id_usuario)";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':p_nombre', $_POST['primer_nombre'], PDO::PARAM_STR);
@@ -74,8 +81,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $stmt->bindValue(':p_apellido', $_POST['primer_apellido'], PDO::PARAM_STR);
             $stmt->bindValue(':s_apellido', $_POST['segundo_apellido'] ?? '', PDO::PARAM_STR);
             $stmt->bindValue(':dui', $_POST['dui'] ?? '', PDO::PARAM_STR);
-            $stmt->bindValue(':fecha_nac', $_POST['fecha_nacimiento'] ?? '', PDO::PARAM_STR);
-            $stmt->bindValue(':sexo', $_POST['sexo'] ?? '', PDO::PARAM_STR);
+            // fecha_nacimiento (DATE) y sexo (ENUM) no aceptan '' bajo el
+            // sql_mode STRICT_TRANS_TABLES de este servidor -- '' rompía la
+            // creación con "Incorrect date value" / "Data truncated for
+            // column sexo" en cuanto se dejaban en blanco (ninguno de los
+            // dos es obligatorio en el formulario). Se guarda NULL en su
+            // lugar, que ambas columnas sí aceptan.
+            $stmt->bindValue(':fecha_nac', ($_POST['fecha_nacimiento'] ?? '') ?: null, PDO::PARAM_STR);
+            $stmt->bindValue(':sexo', ($_POST['sexo'] ?? '') ?: null, PDO::PARAM_STR);
             $stmt->bindValue(':nacionalidad', $_POST['nacionalidad'] ?? 'Salvadoreña', PDO::PARAM_STR);
             $stmt->bindValue(':direccion', $_POST['direccion'] ?? '', PDO::PARAM_STR);
             $stmt->bindValue(':tel_fijo', $_POST['telefono_fijo'] ?? '', PDO::PARAM_STR);
@@ -84,15 +97,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $stmt->bindValue(':id_usuario', $id_usuario, PDO::PARAM_INT);
             $stmt->execute();
             $id_persona = $db->lastInsertId();
-            
-            $query = "INSERT INTO tbl_estudiante (id_persona, nie, estado_familiar, discapacidad, trabaja) 
-                      VALUES (:id_persona, :nie, :estado_familiar, :discapacidad, :trabaja)";
+
+            $query = "INSERT INTO tbl_estudiante (id_persona, nie, estado_familiar, discapacidad, trabaja, id_institucion)
+                      VALUES (:id_persona, :nie, :estado_familiar, :discapacidad, :trabaja, :tid)";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id_persona', $id_persona, PDO::PARAM_INT);
             $stmt->bindValue(':nie', $nie, PDO::PARAM_STR);
             $stmt->bindValue(':estado_familiar', $_POST['estado_familiar'] ?? '', PDO::PARAM_STR);
             $stmt->bindValue(':discapacidad', $_POST['discapacidad'] ?? 'Ninguna', PDO::PARAM_STR);
             $stmt->bindValue(':trabaja', $_POST['trabaja'] ?? 0, PDO::PARAM_INT);
+            $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
             $stmt->execute();
             
             $db->commit();
@@ -102,7 +116,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         } elseif ($accion == 'actualizar') {
             $id_estudiante = $_POST['id_estudiante'];
             $nie = strtoupper(trim($_POST['nie']));
-            
+
+            // Verificar que el estudiante pertenezca a esta institución antes
+            // de editar nada (evita que un admin edite datos de otra institución).
+            TenantGuard::assertOwner($db, 'tbl_estudiante', (int)$id_estudiante);
+
             if (empty($nie)) {
                 throw new Exception('El NIE es obligatorio.');
             }
@@ -157,8 +175,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $stmt->bindValue(':p_apellido', $_POST['primer_apellido'], PDO::PARAM_STR);
             $stmt->bindValue(':s_apellido', $_POST['segundo_apellido'] ?? '', PDO::PARAM_STR);
             $stmt->bindValue(':dui', $_POST['dui'] ?? '', PDO::PARAM_STR);
-            $stmt->bindValue(':fecha_nac', $_POST['fecha_nacimiento'] ?? '', PDO::PARAM_STR);
-            $stmt->bindValue(':sexo', $_POST['sexo'] ?? '', PDO::PARAM_STR);
+            $stmt->bindValue(':fecha_nac', ($_POST['fecha_nacimiento'] ?? '') ?: null, PDO::PARAM_STR);
+            $stmt->bindValue(':sexo', ($_POST['sexo'] ?? '') ?: null, PDO::PARAM_STR);
             $stmt->bindValue(':nacionalidad', $_POST['nacionalidad'] ?? 'Salvadoreña', PDO::PARAM_STR);
             $stmt->bindValue(':direccion', $_POST['direccion'] ?? '', PDO::PARAM_STR);
             $stmt->bindValue(':tel_fijo', $_POST['telefono_fijo'] ?? '', PDO::PARAM_STR);
@@ -183,7 +201,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             
         } elseif ($accion == 'eliminar') {
             $id_estudiante = $_POST['id_estudiante'];
-            
+
+            // Verificar propiedad ANTES de borrar — sin esto, un admin podría
+            // borrar un estudiante de otra institución adivinando el ID.
+            TenantGuard::assertOwner($db, 'tbl_estudiante', (int)$id_estudiante);
+
             $query = "DELETE FROM tbl_matricula WHERE id_estudiante = :id";
             $stmt = $db->prepare($query);
             $stmt->bindValue(':id', $id_estudiante, PDO::PARAM_INT);
@@ -263,9 +285,9 @@ $query = "SELECT e.id, e.nie, e.estado_familiar, e.discapacidad, e.trabaja,
           LEFT JOIN tbl_matricula m ON e.id = m.id_estudiante AND m.estado = 'activo'
           LEFT JOIN tbl_seccion s ON m.id_seccion = s.id
           LEFT JOIN tbl_grado g ON s.id_grado = g.id
-          WHERE 1=1";
+          WHERE e.id_institucion = :tid";
 
-$params = [];
+$params = [':tid' => $tid];
 
 if (!empty($filtro_grado)) {
     $query .= " AND g.id = :grado";
@@ -291,13 +313,30 @@ foreach ($params as $key => $value) {
 $stmt->execute();
 $estudiantes = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-// Obtener grados
-$query = "SELECT id, nombre FROM tbl_grado ORDER BY nombre";
-$grados = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+// Grados para el filtro -- tbl_grado es un catálogo GLOBAL a propósito
+// (id_institucion siempre es NULL, ver config/CatalogoAcademico.php), así
+// que filtrar "WHERE id_institucion = :tid" aquí devolvía SIEMPRE 0 filas
+// y el <select> de Grado nunca tenía opciones (bug reportado por el
+// usuario: el filtro por grado/sección no servía). Se listan solo los
+// grados que de verdad tiene esta institución (con al menos una sección
+// propia), no los 15 del catálogo completo -- si no, se ofrecerían grados
+// que nunca darían resultados al filtrar.
+$stmtG = $db->prepare("SELECT DISTINCT g.id, g.nombre, g.nivel
+                       FROM tbl_grado g
+                       JOIN tbl_seccion s ON s.id_grado = g.id
+                       WHERE s.id_institucion = :tid
+                       ORDER BY g.nivel, g.nombre");
+$stmtG->execute([':tid' => $tid]);
+$grados = $stmtG->fetchAll(PDO::FETCH_ASSOC);
+$niveles_label = ['basica' => 'Educación Básica', 'bachillerato' => 'Bachillerato'];
 
-// Obtener secciones
-$query = "SELECT id, nombre FROM tbl_seccion ORDER BY nombre";
-$secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+// Secciones para el filtro, con su grado (id_grado) para poder filtrar en
+// cascada por JS -- sin esto, secciones de grados distintos que comparten
+// letra (p.ej. "A" de Séptimo y "A" de Primer año) se veían mezcladas y
+// era imposible saber cuál era cuál en el <select>.
+$stmtS = $db->prepare("SELECT s.id, s.nombre, s.id_grado FROM tbl_seccion s WHERE s.id_institucion = :tid ORDER BY s.nombre");
+$stmtS->execute([':tid' => $tid]);
+$secciones = $stmtS->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -342,6 +381,7 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
             <a class="nav-link" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
             <a class="nav-link" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
             <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
+            <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </div>
@@ -354,9 +394,14 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
                 <h2><i class="fas fa-user-graduate"></i> Gestión de Estudiantes</h2>
                 <p class="text-muted mb-0">Administrar información de estudiantes</p>
             </div>
-            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalEstudiante" onclick="prepararModalCrear()">
-                <i class="fas fa-plus"></i> Nuevo Estudiante
-            </button>
+            <div>
+                <button class="btn btn-outline-primary me-2" data-bs-toggle="modal" data-bs-target="#modalImportar" onclick="prepararModalImportar()">
+                    <i class="fas fa-file-excel"></i> Importar desde Excel
+                </button>
+                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#modalEstudiante" onclick="prepararModalCrear()">
+                    <i class="fas fa-plus"></i> Nuevo Estudiante
+                </button>
+            </div>
         </div>
 
         <!-- Messages -->
@@ -373,19 +418,19 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
             <form method="GET" class="row g-3">
                 <div class="col-md-3">
                     <label class="form-label">Grado</label>
-                    <select name="grado" class="form-select">
+                    <select name="grado" id="filtro_grado" class="form-select" onchange="actualizarSeccionesFiltro()">
                         <option value="">Todos</option>
-                        <?php foreach ($grados as $grado): ?>
+                        <?php $nivel_actual = null; foreach ($grados as $grado): if ($grado['nivel'] !== $nivel_actual): if ($nivel_actual !== null) echo '</optgroup>'; echo '<optgroup label="' . htmlspecialchars($niveles_label[$grado['nivel']] ?? $grado['nivel']) . '">'; $nivel_actual = $grado['nivel']; endif; ?>
                         <option value="<?= $grado['id'] ?>" <?= $filtro_grado == $grado['id'] ? 'selected' : '' ?>><?= htmlspecialchars($grado['nombre']) ?></option>
-                        <?php endforeach; ?>
+                        <?php endforeach; if ($nivel_actual !== null) echo '</optgroup>'; ?>
                     </select>
                 </div>
                 <div class="col-md-3">
                     <label class="form-label">Sección</label>
-                    <select name="seccion" class="form-select">
+                    <select name="seccion" id="filtro_seccion" class="form-select">
                         <option value="">Todas</option>
                         <?php foreach ($secciones as $seccion): ?>
-                        <option value="<?= $seccion['id'] ?>" <?= $filtro_seccion == $seccion['id'] ? 'selected' : '' ?>><?= htmlspecialchars($seccion['nombre']) ?></option>
+                        <option value="<?= $seccion['id'] ?>" data-grado="<?= $seccion['id_grado'] ?>" <?= $filtro_seccion == $seccion['id'] ? 'selected' : '' ?>><?= htmlspecialchars($seccion['nombre']) ?></option>
                         <?php endforeach; ?>
                     </select>
                 </div>
@@ -422,9 +467,10 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($estudiantes)): ?>
-                            <tr><td colspan="7" class="text-center py-5 text-muted"><i class="fas fa-inbox fa-3x mb-3 d-block"></i>No hay estudiantes registrados</td></tr>
-                            <?php else: ?>
+                            <?php // Sin fila manual de "sin datos": con DataTables, una tbody con una
+                            // sola fila de 1 <td colspan> frente a un thead de más columnas dispara
+                            // "Incorrect column count" (tn/18). Con tbody vacío, DataTables muestra
+                            // su propio mensaje localizado (idioma es-ES cargado abajo). ?>
                             <?php foreach ($estudiantes as $est): ?>
                             <tr>
                                 <td><span class="badge bg-secondary"><?= htmlspecialchars($est['nie']) ?></span></td>
@@ -467,7 +513,6 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -639,14 +684,116 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
         </div>
     </div>
 
+    <!-- Modal Importar desde Excel -->
+    <div class="modal fade" id="modalImportar" tabindex="-1" data-bs-backdrop="static">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title"><i class="fas fa-file-excel"></i> Importar Estudiantes desde Excel</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="importarPaso1">
+                        <div class="alert alert-info">
+                            <i class="fas fa-info-circle"></i> Puedes dar de alta a varios estudiantes de una sola vez subiendo una hoja de cálculo, en vez de llenar el formulario uno por uno. Opcionalmente también puedes matricularlos (Grado/Sección/Año) en el mismo paso.
+                        </div>
+                        <ol class="mb-4">
+                            <li class="mb-2">Descarga la plantilla: <a href="api/plantilla_estudiantes.php" class="btn btn-sm btn-success"><i class="fas fa-download"></i> Descargar plantilla</a></li>
+                            <li class="mb-2">Llena la hoja "Estudiantes" (revisa la hoja "Instrucciones" dentro del mismo archivo) y borra la fila de ejemplo.</li>
+                            <li>Sube aquí el archivo ya lleno:</li>
+                        </ol>
+                        <div class="mb-3">
+                            <input type="file" id="archivoImportar" class="form-control" accept=".xlsx">
+                        </div>
+                        <div id="importarError" class="alert alert-danger d-none"></div>
+                    </div>
+                    <div id="importarCargando" class="text-center py-5 d-none">
+                        <div class="spinner-border text-primary" role="status"></div>
+                        <p class="mt-2">Procesando archivo, un momento...</p>
+                    </div>
+                    <div id="importarResultado" class="d-none">
+                        <div class="row mb-3 text-center">
+                            <div class="col-md-4">
+                                <div class="card-custom p-3">
+                                    <h3 class="mb-0" id="resTotal">0</h3>
+                                    <small class="text-muted">Filas procesadas</small>
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="card-custom p-3">
+                                    <h3 class="mb-0 text-success" id="resCreados">0</h3>
+                                    <small class="text-muted">Estudiantes creados</small>
+                                </div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="card-custom p-3">
+                                    <h3 class="mb-0 text-danger" id="resErrores">0</h3>
+                                    <small class="text-muted">Con errores</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="resLimitado" class="alert alert-warning d-none"></div>
+                        <div class="d-flex justify-content-between align-items-center mb-2">
+                            <h6 class="mb-0">Detalle por fila</h6>
+                            <button class="btn btn-sm btn-outline-secondary d-none" id="btnDescargarCredenciales" onclick="descargarCredenciales()">
+                                <i class="fas fa-key"></i> Descargar usuarios y contraseñas generados
+                            </button>
+                        </div>
+                        <div class="table-responsive" style="max-height: 400px; overflow-y: auto;">
+                            <table class="table table-sm table-hover">
+                                <thead class="table-light" style="position: sticky; top: 0;">
+                                    <tr>
+                                        <th>Fila</th>
+                                        <th>NIE</th>
+                                        <th>Nombre</th>
+                                        <th>Resultado</th>
+                                        <th>Matrícula</th>
+                                        <th>Usuario / Clave</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tablaResultadoImportar"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                    <button type="button" class="btn btn-primary" id="btnSubirImportar" onclick="subirImportar()">
+                        <i class="fas fa-upload"></i> Subir e Importar
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Scripts -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.4/js/jquery.dataTables.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
-    
+
     <script>
+        // Se repuebla el <select> de Sección con solo las secciones del
+        // grado elegido en el filtro (usa el data-grado ya renderizado en
+        // cada <option>, sin necesidad de otra consulta al servidor). Si
+        // no hay grado elegido, se muestran todas las secciones del tenant.
+        function actualizarSeccionesFiltro() {
+            const idGrado = $('#filtro_grado').val();
+            const valorActual = $('#filtro_seccion').val();
+            $('#filtro_seccion option').each(function() {
+                const esTodas = $(this).val() === '';
+                const perteneceAlGrado = !idGrado || $(this).data('grado') == idGrado;
+                $(this).toggle(esTodas || perteneceAlGrado);
+            });
+            // Si la sección que estaba elegida ya no pertenece al nuevo grado, se limpia.
+            if (valorActual && !$(`#filtro_seccion option[value="${valorActual}"]`).is(':visible')) {
+                $('#filtro_seccion').val('');
+            }
+        }
+
         $(document).ready(function() {
+            actualizarSeccionesFiltro(); // aplica el filtro también al cargar la página (p.ej. con ?grado= en la URL)
+
             $('#tablaEstudiantes').DataTable({
                 language: {
                     "sProcessing":     "Procesando...",
@@ -699,6 +846,16 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
                     $(this).addClass('is-invalid').removeClass('is-valid');
                 } else {
                     $(this).removeClass('is-invalid').addClass('is-valid');
+                }
+            });
+
+            // Se recarga la página al cerrar el modal de importación (por
+            // cualquier vía: botón, Esc o clic fuera) si se creó al menos un
+            // estudiante, para que la tabla y los filtros reflejen los nuevos
+            // registros -- igual que ya pasa tras crear uno por uno.
+            $('#modalImportar').on('hidden.bs.modal', function() {
+                if (importoAlgunEstudiante) {
+                    window.location.reload();
                 }
             });
         });
@@ -859,6 +1016,132 @@ $secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
                 $('body').append(form);
                 form.submit();
             }
+        }
+
+        // ===== IMPORTAR ESTUDIANTES DESDE EXCEL =====
+        let importoAlgunEstudiante = false;
+        let credencialesGeneradas = []; // { usuario, clave, nombre, nie } de los creados con clave autogenerada
+
+        function prepararModalImportar() {
+            importoAlgunEstudiante = false;
+            credencialesGeneradas = [];
+            $('#archivoImportar').val('');
+            $('#importarError').addClass('d-none').text('');
+            $('#importarCargando').addClass('d-none');
+            $('#importarResultado').addClass('d-none');
+            $('#importarPaso1').removeClass('d-none');
+            $('#btnSubirImportar').prop('disabled', false).show();
+        }
+
+        function subirImportar() {
+            const input = document.getElementById('archivoImportar');
+            if (!input.files || !input.files[0]) {
+                $('#importarError').removeClass('d-none').text('Selecciona primero el archivo .xlsx ya lleno.');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('archivo', input.files[0]);
+
+            $('#importarError').addClass('d-none').text('');
+            $('#importarPaso1').addClass('d-none');
+            $('#importarCargando').removeClass('d-none');
+            $('#btnSubirImportar').prop('disabled', true);
+
+            $.ajax({
+                url: 'api/importar_estudiantes.php',
+                method: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                dataType: 'json',
+                success: function(resp) {
+                    $('#importarCargando').addClass('d-none');
+                    if (!resp.success) {
+                        $('#importarPaso1').removeClass('d-none');
+                        $('#importarError').removeClass('d-none').text(resp.error || 'No se pudo procesar el archivo.');
+                        $('#btnSubirImportar').prop('disabled', false);
+                        return;
+                    }
+                    mostrarResultadoImportar(resp);
+                },
+                error: function(xhr) {
+                    $('#importarCargando').addClass('d-none');
+                    $('#importarPaso1').removeClass('d-none');
+                    let msg = 'No se pudo conectar con el servidor.';
+                    if (xhr.responseJSON && xhr.responseJSON.error) msg = xhr.responseJSON.error;
+                    $('#importarError').removeClass('d-none').text(msg);
+                    $('#btnSubirImportar').prop('disabled', false);
+                }
+            });
+        }
+
+        function mostrarResultadoImportar(resp) {
+            $('#resTotal').text(resp.total_filas);
+            $('#resCreados').text(resp.creados);
+            $('#resErrores').text(resp.con_errores);
+
+            let avisos = [];
+            if (resp.limitado) {
+                avisos.push('<i class="fas fa-exclamation-triangle"></i> El archivo tiene más de ' + resp.max_filas +
+                    ' filas; solo se procesaron las primeras ' + resp.max_filas + '. Sube el resto en otro archivo.');
+            }
+            if (resp.omitidas > 0) {
+                avisos.push('<i class="fas fa-info-circle"></i> ' + resp.omitidas + ' fila(s) en blanco se ignoraron (no cuentan como creadas ni con error).');
+            }
+            if (avisos.length > 0) {
+                $('#resLimitado').removeClass('d-none').html(avisos.join('<br>'));
+            } else {
+                $('#resLimitado').addClass('d-none');
+            }
+
+            const $tbody = $('#tablaResultadoImportar').empty();
+            credencialesGeneradas = [];
+            resp.detalle.forEach(function(fila) {
+                const esError = fila.estado === 'error';
+                if (!esError) importoAlgunEstudiante = true;
+
+                let colUsuario = '-';
+                if (!esError) {
+                    colUsuario = '<span class="badge bg-info">' + $('<div>').text(fila.usuario).html() + '</span>';
+                    if (fila.clave_generada) {
+                        colUsuario += ' <code>' + $('<div>').text(fila.clave_generada).html() + '</code>';
+                        credencialesGeneradas.push({
+                            nie: fila.nie, nombre: fila.nombre, usuario: fila.usuario, clave: fila.clave_generada
+                        });
+                    }
+                }
+
+                const $tr = $('<tr>').toggleClass('table-danger', esError).toggleClass('table-success', !esError);
+                $tr.append($('<td>').text(fila.fila));
+                $tr.append($('<td>').text(fila.nie));
+                $tr.append($('<td>').text(fila.nombre));
+                $tr.append($('<td>').text(fila.mensaje));
+                $tr.append($('<td>').text(fila.matricula || '-'));
+                $tr.append($('<td>').html(colUsuario));
+                $tbody.append($tr);
+            });
+
+            $('#btnDescargarCredenciales').toggleClass('d-none', credencialesGeneradas.length === 0);
+            $('#importarResultado').removeClass('d-none');
+            $('#btnSubirImportar').hide();
+        }
+
+        function descargarCredenciales() {
+            let contenido = 'NIE,Nombre,Usuario,Contraseña\n';
+            credencialesGeneradas.forEach(function(c) {
+                const escapar = (v) => '"' + String(v).replace(/"/g, '""') + '"';
+                contenido += [escapar(c.nie), escapar(c.nombre), escapar(c.usuario), escapar(c.clave)].join(',') + '\n';
+            });
+            const blob = new Blob(["﻿" + contenido], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'credenciales_estudiantes_importados.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
         }
     </script>
 </body>

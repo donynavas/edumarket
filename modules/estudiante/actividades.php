@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -11,11 +12,12 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del estudiante
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante,
-          m.id as id_matricula, m.anno, m.id_periodo,
+          m.id as id_matricula, m.anno,
           s.id as id_seccion,
           p.primer_nombre, p.primer_apellido
           FROM tbl_estudiante e
@@ -24,10 +26,12 @@ $query = "SELECT
           JOIN tbl_seccion s ON m.id_seccion = s.id
           WHERE p.id_usuario = :user_id
           AND m.estado = 'activo'
+          AND e.id_institucion = :tid
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $datos = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -40,7 +44,7 @@ $id_estudiante = $datos['id_estudiante'];
 $id_matricula = $datos['id_matricula'];
 $id_seccion = $datos['id_seccion'];
 $anno = $datos['anno'];
-$periodo = $datos['id_periodo'];
+// NOTA: ya no se filtra por "período" -- ver estudiante_dashboard.php.
 
 // ===== PROCESAR ENTREGA DE ACTIVIDAD =====
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
@@ -48,10 +52,28 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
         $db->beginTransaction();
         
         if ($_POST['accion'] == 'entregar') {
-            $id_actividad = $_POST['id_actividad'];
+            $id_actividad = (int) $_POST['id_actividad'];
             $respuesta = $_POST['respuesta'] ?? '';
             $archivo_url = '';
-            
+
+            // La actividad DEBE pertenecer a una asignación de la sección/período del estudiante.
+            // tbl_asignacion_docente no tiene columna id_institucion; no hace
+            // falta filtrarla aparte porque $id_seccion ya viene de una
+            // consulta anterior filtrada por tbl_estudiante.id_institucion.
+            $checkAct = $db->prepare("SELECT act.id FROM tbl_actividad act
+                                      JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
+                                      WHERE act.id = :id_actividad
+                                      AND ad.id_seccion = :id_seccion
+                                      AND ad.anno = :anno");
+            $checkAct->execute([
+                ':id_actividad' => $id_actividad,
+                ':id_seccion' => $id_seccion,
+                ':anno' => $anno
+            ]);
+            if ($checkAct->rowCount() === 0) {
+                throw new Exception('No tiene permiso para entregar esta actividad');
+            }
+
             // Subir archivo si existe
             if (isset($_FILES['archivo']) && $_FILES['archivo']['error'] == 0) {
                 $upload_dir = '../../uploads/entregas/';
@@ -68,31 +90,33 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
                 }
             }
             
-            // Verificar si ya existe entrega
-            $check = $db->prepare("SELECT id FROM tbl_entrega_actividad 
-                                  WHERE id_actividad = :id_actividad 
+            // Verificar si ya existe entrega. tbl_entrega_actividad no tiene
+            // columna id_institucion; :id_matricula ya está tenant-verificado
+            // (viene de la consulta inicial filtrada por e.id_institucion).
+            $check = $db->prepare("SELECT id FROM tbl_entrega_actividad
+                                  WHERE id_actividad = :id_actividad
                                   AND id_matricula = :id_matricula");
             $check->execute([
                 ':id_actividad' => $id_actividad,
                 ':id_matricula' => $id_matricula
             ]);
-            
+
             if ($check->rowCount() > 0) {
                 // Actualizar entrega existente
-                $query = "UPDATE tbl_entrega_actividad SET 
-                         observacion_docente = :respuesta, 
+                $query = "UPDATE tbl_entrega_actividad SET
+                         observacion_docente = :respuesta,
                          archivo_url = :archivo_url,
                          estado_entrega = 'entregado',
                          fecha_entrega = NOW()
-                         WHERE id_actividad = :id_actividad 
+                         WHERE id_actividad = :id_actividad
                          AND id_matricula = :id_matricula";
             } else {
                 // Crear nueva entrega
-                $query = "INSERT INTO tbl_entrega_actividad 
-                         (id_actividad, id_matricula, observacion_docente, archivo_url, estado_entrega, fecha_entrega) 
+                $query = "INSERT INTO tbl_entrega_actividad
+                         (id_actividad, id_matricula, observacion_docente, archivo_url, estado_entrega, fecha_entrega)
                          VALUES (:id_actividad, :id_matricula, :respuesta, :archivo_url, 'entregado', NOW())";
             }
-            
+
             $stmt = $db->prepare($query);
             $stmt->execute([
                 ':id_actividad' => $id_actividad,
@@ -119,27 +143,40 @@ $filtro_estado = $_GET['estado'] ?? 'todos';
 $filtro_materia = $_GET['materia'] ?? '';
 
 // ✅ CORREGIDO: Usando la estructura real de la BD
-$query_actividades = "SELECT 
-    act.id, act.titulo, act.descripcion, act.tipo, act.fecha_programada, act.fecha_limite, 
+//
+// Las actividades de tipo 'examen' NUNCA tienen fila en
+// tbl_entrega_actividad (esa tabla es solo para tareas calificadas
+// manualmente por el profesor) -- su entrega/nota vive en
+// tbl_intento_examen. vw_logro_estudiante (migrations/2026_08_16_vista_
+// logro_estudiante.sql) unifica ambas fuentes -- ver esa migración para
+// el porqué. archivo_url es exclusivo de tareas (adjunto que sube el
+// estudiante), así que se sigue leyendo aparte de tbl_entrega_actividad;
+// todo lo demás (si está entregada, su nota, su estado) sale de la vista.
+$query_actividades = "SELECT
+    act.id, act.id_examen, act.titulo, act.descripcion, act.tipo, act.fecha_programada, act.fecha_limite,
     act.nota_maxima, act.estado as estado_actividad, act.contenido, act.url_recurso,
     asig.id as id_asignatura, asig.nombre as asignatura,
-    ea.id as id_entrega, ea.archivo_url, ea.estado_entrega, 
-    ea.nota_obtenida, ea.observacion_docente, ea.fecha_entrega,
+    v.id_registro_origen as id_entrega,
+    ea.archivo_url,
+    v.estado_entrega,
+    v.nota_obtenida,
+    v.observacion_docente,
+    v.fecha_entrega,
     DATEDIFF(act.fecha_limite, NOW()) as dias_restantes
     FROM tbl_actividad act
     JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
     JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
     LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad AND ea.id_matricula = :id_matricula
+    LEFT JOIN vw_logro_estudiante v ON v.id_actividad = act.id AND v.id_matricula = :id_matricula_v
     WHERE ad.id_seccion = :id_seccion
     AND ad.anno = :anno
-    AND ad.id_periodo = :periodo
     AND act.estado IN ('publicado', 'activo')";
 
 $params = [
     ':id_matricula' => $id_matricula,
+    ':id_matricula_v' => $id_matricula,
     ':id_seccion' => $id_seccion,
-    ':anno' => $anno,
-    ':periodo' => $periodo
+    ':anno' => $anno
 ];
 
 if ($filtro_tipo != 'todos') {
@@ -153,11 +190,11 @@ if (!empty($filtro_materia)) {
 }
 
 if ($filtro_estado == 'pendientes') {
-    $query_actividades .= " AND (ea.id IS NULL OR ea.estado_entrega != 'calificado') AND act.fecha_limite >= CURDATE()";
+    $query_actividades .= " AND (v.id_registro_origen IS NULL OR v.estado_entrega != 'calificado') AND act.fecha_limite >= CURDATE()";
 } elseif ($filtro_estado == 'entregadas') {
-    $query_actividades .= " AND ea.id IS NOT NULL AND ea.estado_entrega = 'entregado'";
+    $query_actividades .= " AND v.id_registro_origen IS NOT NULL AND v.estado_entrega = 'entregado'";
 } elseif ($filtro_estado == 'calificadas') {
-    $query_actividades .= " AND ea.id IS NOT NULL AND ea.estado_entrega = 'calificado'";
+    $query_actividades .= " AND v.id_registro_origen IS NOT NULL AND v.estado_entrega = 'calificado'";
 }
 
 $query_actividades .= " ORDER BY act.fecha_limite ASC";
@@ -364,8 +401,8 @@ $tipos_actividad = [
                             <?php endif; ?>
                         </div>
                         <div class="col-md-3">
-                            <small class="d-block"><i class="fas fa-calendar"></i> Entrega: <?= date('d/m/Y', strtotime($act['fecha_limite'])) ?></small>
-                            <small class="d-block"><i class="fas fa-clock"></i> <?= $dias >= 0 ? $dias . ' días restantes' : 'Vencida' ?></small>
+                            <small class="d-block"><i class="fas fa-calendar"></i> Entrega: <?= $act['fecha_limite'] ? date('d/m/Y', strtotime($act['fecha_limite'])) : 'Sin fecha límite' ?></small>
+                            <small class="d-block"><i class="fas fa-clock"></i> <?= $dias === null ? 'Sin fecha límite' : ($dias >= 0 ? $dias . ' días restantes' : 'Vencida') ?></small>
                             <?php if ($act['nota_maxima']): ?>
                             <small class="d-block"><i class="fas fa-star"></i> Valor: <?= $act['nota_maxima'] ?> pts</small>
                             <?php endif; ?>
@@ -377,9 +414,15 @@ $tipos_actividad = [
                             <?php endif; ?>
                         </div>
                         <div class="col-md-1 text-end">
+                            <?php if ($act['tipo'] === 'examen' && !empty($act['id_examen'])): ?>
+                            <a href="tomar_examen.php?id=<?= $act['id_examen'] ?>" class="btn btn-sm btn-danger" title="Tomar examen">
+                                <i class="fas fa-file-signature"></i>
+                            </a>
+                            <?php else: ?>
                             <button class="btn btn-sm btn-primary" onclick="verDetalle(<?= $act['id'] ?>)">
                                 <i class="fas fa-eye"></i>
                             </button>
+                            <?php endif; ?>
                         </div>
                     </div>
                 </div>

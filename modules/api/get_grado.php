@@ -6,23 +6,26 @@ if (!isset($_SESSION['user_id'])) {
     exit('Acceso denegado');
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 
 $id = $_GET['id'] ?? 0;
 $editar = $_GET['editar'] ?? false;
 
-$query = "SELECT g.*, 
+$query = "SELECT g.*,
           COUNT(DISTINCT s.id) as total_secciones,
           COUNT(DISTINCT m.id) as total_estudiantes
           FROM tbl_grado g
           LEFT JOIN tbl_seccion s ON g.id = s.id_grado
           LEFT JOIN tbl_matricula m ON s.id = m.id_seccion AND m.estado = 'activo'
-          WHERE g.id = :id
+          WHERE g.id = :id AND g.id_institucion = :tid
           GROUP BY g.id";
 
 $stmt = $db->prepare($query);
 $stmt->bindParam(':id', $id);
+$stmt->bindParam(':tid', $tid);
 $stmt->execute();
 $grado = $stmt->fetch(PDO::FETCH_ASSOC);
 

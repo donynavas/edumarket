@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -11,14 +12,15 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos del estudiante
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante, e.nie,
           p.primer_nombre, p.primer_apellido,
           g.id as id_grado, g.nombre as grado_nombre, g.nivel, g.nota_minima_aprobacion,
           s.id as id_seccion, s.nombre as seccion_nombre,
-          m.id as id_matricula, m.anno, m.id_periodo, m.estado
+          m.id as id_matricula, m.anno, m.estado
           FROM tbl_estudiante e
           JOIN tbl_persona p ON e.id_persona = p.id
           JOIN tbl_matricula m ON e.id = m.id_estudiante
@@ -26,11 +28,13 @@ $query = "SELECT
           JOIN tbl_grado g ON s.id_grado = g.id
           WHERE p.id_usuario = :user_id
           AND m.estado = 'activo'
-          ORDER BY m.anno DESC, m.id_periodo DESC
+          AND e.id_institucion = :tid
+          ORDER BY m.anno DESC, m.id DESC
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -66,40 +70,43 @@ $id_estudiante = $estudiante['id_estudiante'];
 $id_matricula = $estudiante['id_matricula'];
 $id_seccion = $estudiante['id_seccion'];
 $anno = $estudiante['anno'];
-$periodo = $estudiante['id_periodo'];
 
 // ===== OBTENER CLASES/MATERIAS =====
 $filtro_busqueda = $_GET['busqueda'] ?? '';
 
-// ✅ CORREGIDO: El filtro de período va en el WHERE, no en el JOIN
-$query_clases = "SELECT 
+// NOTA: ya no se filtra por "período" -- una asignación docente dura el año
+// lectivo completo (ver nota igual en estudiante_dashboard.php).
+//
+// Igual que en actividades.php/ver_materia.php: un examen calificado no
+// tiene fila en tbl_entrega_actividad, así que sin vw_logro_estudiante
+// (migrations/2026_08_16_vista_logro_estudiante.sql) la tarjeta de la
+// materia mostraba "0/N completadas" y "0%" de progreso aunque el
+// estudiante ya hubiera presentado y aprobado el examen.
+$query_clases = "SELECT
     ad.id as id_asignacion,
     asig.id as id_asignatura, asig.nombre as asignatura, asig.codigo,
     per.primer_nombre as profesor_nombre, per.primer_apellido as profesor_apellido, per.email as profesor_email,
     prof.especialidad as profesor_especialidad,
     COUNT(DISTINCT act.id) as total_actividades,
-    COUNT(DISTINCT CASE WHEN ea.id IS NOT NULL AND ea.estado_entrega = 'calificado' THEN ea.id END) as actividades_calificadas,
-    COUNT(DISTINCT CASE WHEN ea.id IS NOT NULL AND ea.estado_entrega != 'calificado' THEN ea.id END) as actividades_pendientes,
-    AVG(ea.nota_obtenida) as promedio_materia,
+    COUNT(DISTINCT CASE WHEN v.estado_entrega = 'calificado' THEN act.id END) as actividades_calificadas,
+    COUNT(DISTINCT CASE WHEN v.id_registro_origen IS NOT NULL AND v.estado_entrega != 'calificado' THEN act.id END) as actividades_pendientes,
+    AVG(CASE WHEN v.estado_entrega = 'calificado' THEN v.nota_obtenida END) as promedio_materia,
     MAX(act.fecha_limite) as proxima_entrega
     FROM tbl_asignacion_docente ad
     JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
     JOIN tbl_profesor prof ON ad.id_profesor = prof.id
     JOIN tbl_persona per ON prof.id_persona = per.id
-    LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente 
+    LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente
         AND act.estado IN ('publicado', 'activo')
-    LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad 
-        AND ea.id_matricula = :id_matricula
+    LEFT JOIN vw_logro_estudiante v ON v.id_actividad = act.id AND v.id_matricula = :id_matricula
     WHERE ad.id_seccion = :id_seccion
     AND ad.anno = :anno
-    AND ad.id_periodo = :periodo
     GROUP BY ad.id
     ORDER BY asig.nombre";
 
 $params = [
     ':id_seccion' => $id_seccion,
     ':anno' => $anno,
-    ':periodo' => $periodo,
     ':id_matricula' => $id_matricula
 ];
 
@@ -192,7 +199,7 @@ function getColorMateria($nombre) {
         <div class="d-flex justify-content-between align-items-center mb-4">
             <div>
                 <h2><i class="fas fa-book-open"></i> Mis Clases</h2>
-                <p class="text-muted mb-0"><?= $total_clases ?> materias inscritas • Período <?= $periodo ?> <?= $anno ?></p>
+                <p class="text-muted mb-0"><?= $total_clases ?> materias inscritas • Año lectivo <?= $anno ?></p>
             </div>
             <button class="btn btn-outline-primary btn-sm" id="sidebarToggle"><i class="fas fa-bars"></i></button>
         </div>

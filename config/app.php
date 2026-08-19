@@ -45,12 +45,48 @@ define('BASE_URL',  $protocol . '://' . $host . $projectRoot);
 define('BASE_PATH', $projectRoot);  // e.g., "/educacionplus" o ""
 
 // =====================================================
+// CARGAR VARIABLES DE ENTORNO (.env)
+// =====================================================
+// Loader minimalista (sin dependencias) para no exponer credenciales en el
+// código fuente. Copiar .env.example a .env y completar los valores reales;
+// .env NUNCA debe subirse al control de versiones (ver .gitignore).
+function load_env(string $path): void {
+    if (!is_file($path)) return;
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#')) continue;
+        if (!str_contains($line, '=')) continue;
+        [$key, $value] = explode('=', $line, 2);
+        $key   = trim($key);
+        $value = trim($value);
+        // Quitar comillas envolventes si existen
+        if (strlen($value) >= 2 && (
+            ($value[0] === '"' && str_ends_with($value, '"')) ||
+            ($value[0] === "'" && str_ends_with($value, "'"))
+        )) {
+            $value = substr($value, 1, -1);
+        }
+        if (getenv($key) === false) {
+            putenv("$key=$value");
+            $_ENV[$key] = $value;
+        }
+    }
+}
+load_env(__DIR__ . '/../.env');
+
+function env(string $key, ?string $default = null): ?string {
+    $value = getenv($key);
+    return $value !== false ? $value : $default;
+}
+
+// =====================================================
 // CONFIGURACIÓN DE BASE DE DATOS
 // =====================================================
-define('DB_HOST', '127.0.0.1');
-define('DB_NAME', 'educacion_plus');
-define('DB_USER', 'root');
-define('DB_PASS', '');  // ← Cambiar en producción
+// En producción estos valores DEBEN venir de .env, nunca hardcodeados aquí.
+define('DB_HOST', env('DB_HOST', '127.0.0.1'));
+define('DB_NAME', env('DB_NAME', 'educacion_plus'));
+define('DB_USER', env('DB_USER', 'root'));
+define('DB_PASS', env('DB_PASS', ''));
 
 // =====================================================
 // CONFIGURACIÓN DE APLICACIÓN

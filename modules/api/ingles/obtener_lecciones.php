@@ -9,6 +9,14 @@ session_start();
 header('Content-Type: application/json');
 require_once __DIR__ . '/../../../config/database.php';
 
+// Nota: el catálogo de lecciones de inglés es contenido compartido entre
+// instituciones (no tiene id_institucion en el esquema), por diseño. Sólo
+// se exige sesión activa, no se filtra por tenant.
+if (!isset($_SESSION['user_id'])) {
+    echo json_encode(['success' => false, 'message' => 'No autorizado']);
+    exit;
+}
+
 $tipo = $_GET['tipo'] ?? '';
 $nivel = $_GET['nivel'] ?? '';
 $id_curso = $_GET['id_curso'] ?? 0;

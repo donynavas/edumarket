@@ -8,6 +8,8 @@ if (!isset($_SESSION['user_id']) || !in_array($_SESSION['rol'], ['admin', 'direc
     exit;
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 $mensaje = '';
@@ -16,18 +18,18 @@ $tipo_mensaje = '';
 // ===== PROCESAR ACCIONES POST =====
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $accion = $_POST['accion'] ?? '';
-    
+
     try {
         $db->beginTransaction();
-        
+
         match($accion) {
-            'crear' => crearProfesor($db),
-            'actualizar' => actualizarProfesor($db),
-            'eliminar' => eliminarProfesor($db),
-            'asignar_materias' => asignarMaterias($db),
+            'crear' => crearProfesor($db, $tid),
+            'actualizar' => actualizarProfesor($db, $tid),
+            'eliminar' => eliminarProfesor($db, $tid),
+            'asignar_materias' => asignarMaterias($db, $tid),
             default => throw new Exception('Acción no válida')
         };
-        
+
         $db->commit();
     } catch (Exception $e) {
         $db->rollBack();
@@ -37,9 +39,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // ===== FUNCIONES DE PROCESAMIENTO =====
-function crearProfesor($db) {
+function crearProfesor($db, $tid) {
     global $mensaje, $tipo_mensaje;
-    
+
     // Validar datos requeridos
     $required = ['usuario', 'password', 'primer_nombre', 'primer_apellido', 'dui', 'fecha_nacimiento', 'sexo', 'email', 'celular', 'especialidad', 'titulo_academico'];
     foreach ($required as $field) {
@@ -56,18 +58,30 @@ function crearProfesor($db) {
     }
     
     // Crear usuario
-    $query = "INSERT INTO tbl_usuario (usuario, password, rol, estado) VALUES (:usuario, :password, 'profesor', 1)";
+    // Nota: tbl_usuario.nombre es NOT NULL sin default (columna legacy
+    // duplicada respecto a tbl_persona) — se completa con el nombre
+    // completo para que el INSERT no falle en un servidor con SQL strict mode.
+    $nombre_completo = trim($_POST['primer_nombre'] . ' ' . $_POST['primer_apellido']);
+    $query = "INSERT INTO tbl_usuario (nombre, usuario, password, email, rol, estado, id_institucion) VALUES (:nombre, :usuario, :password, :email, 'profesor', 1, :tid)";
     $stmt = $db->prepare($query);
     $stmt->execute([
+        ':nombre' => $nombre_completo,
         ':usuario' => $_POST['usuario'],
-        ':password' => password_hash($_POST['password'], PASSWORD_DEFAULT)
+        ':password' => password_hash($_POST['password'], PASSWORD_DEFAULT),
+        ':email' => $_POST['email'],
+        ':tid' => $tid
     ]);
     $id_usuario = $db->lastInsertId();
-    
+
     // Crear persona
-    $query = "INSERT INTO tbl_persona (id_usuario, primer_nombre, segundo_nombre, primer_apellido, segundo_apellido, 
-              dui, fecha_nacimiento, sexo, nacionalidad, direccion, telefono_fijo, celular, email) 
-              VALUES (:id_usuario, :p_nombre, :s_nombre, :p_apellido, :s_apellido, :dui, :fecha_nac, :sexo, 
+    // Nota: tbl_persona NO tiene columna id_institucion (a diferencia de
+    // tbl_usuario/tbl_profesor) — el INSERT original la referenciaba y
+    // hacía fallar el alta de cualquier profesor con "Unknown column
+    // 'id_institucion'". También se agrega tercer_nombre, que es NOT NULL
+    // sin default en el esquema real.
+    $query = "INSERT INTO tbl_persona (id_usuario, primer_nombre, segundo_nombre, tercer_nombre, primer_apellido, segundo_apellido,
+              dui, fecha_nacimiento, sexo, nacionalidad, direccion, telefono_fijo, celular, email)
+              VALUES (:id_usuario, :p_nombre, :s_nombre, '', :p_apellido, :s_apellido, :dui, :fecha_nac, :sexo,
               :nacionalidad, :direccion, :tel_fijo, :celular, :email)";
     $stmt = $db->prepare($query);
     $stmt->execute([
@@ -83,31 +97,35 @@ function crearProfesor($db) {
         ':direccion' => $_POST['direccion'] ?? '',
         ':tel_fijo' => $_POST['telefono_fijo'] ?? '',
         ':celular' => $_POST['celular'],
-        ':email' => $_POST['email']
+        ':email' => $_POST['email'],
     ]);
     $id_persona = $db->lastInsertId();
-    
+
     // Crear profesor
-    $query = "INSERT INTO tbl_profesor (id_persona, especialidad, titulo_academico) VALUES (:id_persona, :especialidad, :titulo)";
+    // Nota: tbl_profesor.estado es varchar NOT NULL sin default; se omitía
+    // en el INSERT y quedaba vacío en servidores sin SQL strict mode.
+    $query = "INSERT INTO tbl_profesor (id_persona, estado, especialidad, titulo_academico, id_institucion) VALUES (:id_persona, 'activo', :especialidad, :titulo, :tid)";
     $stmt = $db->prepare($query);
     $stmt->execute([
         ':id_persona' => $id_persona,
         ':especialidad' => $_POST['especialidad'],
-        ':titulo' => $_POST['titulo_academico']
+        ':titulo' => $_POST['titulo_academico'],
+        ':tid' => $tid
     ]);
     
     $mensaje = 'Profesor creado exitosamente';
     $tipo_mensaje = 'success';
 }
 
-function actualizarProfesor($db) {
+function actualizarProfesor($db, $tid) {
     global $mensaje, $tipo_mensaje;
-    
+
     $id_profesor = $_POST['id_profesor'] ?? 0;
     if (!$id_profesor) {
         throw new Exception('ID de profesor no válido');
     }
-    
+    TenantGuard::assertOwner($db, 'tbl_profesor', (int)$id_profesor);
+
     // Actualizar persona
     $query = "UPDATE tbl_persona SET primer_nombre = :p_nombre, segundo_nombre = :s_nombre, 
               primer_apellido = :p_apellido, segundo_apellido = :s_apellido, dui = :dui, 
@@ -157,14 +175,15 @@ function actualizarProfesor($db) {
     $tipo_mensaje = 'success';
 }
 
-function eliminarProfesor($db) {
+function eliminarProfesor($db, $tid) {
     global $mensaje, $tipo_mensaje;
-    
+
     $id_profesor = $_POST['id_profesor'] ?? 0;
     if (!$id_profesor) {
         throw new Exception('ID de profesor no válido');
     }
-    
+    TenantGuard::assertOwner($db, 'tbl_profesor', (int)$id_profesor);
+
     // Desactivar usuario (soft delete)
     $query = "UPDATE tbl_usuario u
               JOIN tbl_persona p ON u.id = p.id_usuario
@@ -177,36 +196,58 @@ function eliminarProfesor($db) {
     $tipo_mensaje = 'warning';
 }
 
-function asignarMaterias($db) {
+function asignarMaterias($db, $tid) {
     global $mensaje, $tipo_mensaje;
-    
+
     $id_profesor = $_POST['id_profesor'] ?? 0;
     $asignaturas = $_POST['asignaturas'] ?? [];
     $secciones = $_POST['secciones'] ?? [];
-    $periodo = $_POST['id_periodo'] ?? 1;
     $anno = $_POST['anno'] ?? date('Y');
-    
+
     if (!$id_profesor) {
         throw new Exception('ID de profesor no válido');
     }
-    
+    TenantGuard::assertOwner($db, 'tbl_profesor', (int)$id_profesor);
+
     $count = 0;
     foreach ($asignaturas as $key => $id_asignatura) {
         if (!empty($id_asignatura) && !empty($secciones[$key])) {
-            $query = "INSERT INTO tbl_asignacion_docente (id_profesor, id_asignatura, id_seccion, id_periodo, anno) 
-                      VALUES (:id_profesor, :id_asignatura, :id_seccion, :id_periodo, :anno)";
+            // Verificar que la sección y la asignatura sean de esta institución
+            TenantGuard::assertOwner($db, 'tbl_seccion', (int)$secciones[$key]);
+            TenantGuard::assertOwner($db, 'tbl_asignatura', (int)$id_asignatura);
+
+            // tbl_asignacion_docente no tiene columna id_institucion; profesor/
+            // asignatura/sección ya se verificaron como propios arriba.
+            // 'estado' es NOT NULL sin default en el esquema real; el INSERT
+            // original no lo incluía, causando un segundo fallo independiente.
+            //
+            // id_periodo YA NO se completa aquí. Fase 4 de esta sesión lo dejó
+            // en NULL asumiendo que era vestigial; luego se restauró
+            // temporalmente (con un <select> aquí) al descubrir que
+            // modules/estudiante/*.php y otros lo usaban como filtro de
+            // visibilidad "ad.id_periodo = :periodo" -- eso causaba que un
+            // examen/actividad recién asignado no apareciera para el
+            // estudiante. La corrección definitiva no fue restaurar
+            // id_periodo, sino QUITAR ese filtro por completo de todos sus
+            // lectores (dashboard, Mis Clases, Actividades, calendario,
+            // Calificaciones, Reporte de Notas): una asignación docente y una
+            // matrícula duran el año lectivo completo, no un trimestre. El
+            // seguimiento real de CALIFICACIONES por período (Cuadro de
+            // Notas) vive aparte en tbl_periodo/tbl_nota_periodo (Fases 5 y
+            // 6), con períodos reales por fecha, no este entero legado 1-4.
+            $query = "INSERT INTO tbl_asignacion_docente (id_profesor, id_asignatura, id_seccion, anno, estado)
+                      VALUES (:id_profesor, :id_asignatura, :id_seccion, :anno, 1)";
             $stmt = $db->prepare($query);
             $stmt->execute([
                 ':id_profesor' => $id_profesor,
                 ':id_asignatura' => $id_asignatura,
                 ':id_seccion' => $secciones[$key],
-                ':id_periodo' => $periodo,
                 ':anno' => $anno
             ]);
             $count++;
         }
     }
-    
+
     $mensaje = "$count asignaciones creadas exitosamente";
     $tipo_mensaje = 'success';
 }
@@ -228,9 +269,9 @@ $query = "SELECT p.id, per.primer_nombre, per.segundo_nombre, per.primer_apellid
           JOIN tbl_usuario u ON per.id_usuario = u.id
           LEFT JOIN tbl_asignacion_docente ad ON p.id = ad.id_profesor
           LEFT JOIN tbl_asignatura a ON ad.id_asignatura = a.id
-          WHERE 1=1";
+          WHERE p.id_institucion = :tid";
 
-$params = [];
+$params = [':tid' => $tid];
 
 if ($filtros['estado'] === 'activo') {
     $query .= " AND u.estado = 1";
@@ -258,10 +299,31 @@ $stmt->execute();
 $profesores = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Obtener datos auxiliares
-$especialidades = $db->query("SELECT DISTINCT especialidad FROM tbl_profesor WHERE especialidad IS NOT NULL AND especialidad != '' ORDER BY especialidad")->fetchAll(PDO::FETCH_COLUMN);
-$asignaturas = $db->query("SELECT id, nombre, codigo FROM tbl_asignatura ORDER BY nombre")->fetchAll(PDO::FETCH_ASSOC);
-$secciones = $db->query("SELECT id, nombre FROM tbl_seccion ORDER BY nombre")->fetchAll(PDO::FETCH_ASSOC);
-$periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Trimestre', 4 => 'Cuarto Trimestre'];
+$stmtEsp = $db->prepare("SELECT DISTINCT especialidad FROM tbl_profesor WHERE especialidad IS NOT NULL AND especialidad != '' AND id_institucion = :tid ORDER BY especialidad");
+$stmtEsp->execute([':tid' => $tid]);
+$especialidades = $stmtEsp->fetchAll(PDO::FETCH_COLUMN);
+
+$stmtAsig = $db->prepare("SELECT id, nombre, codigo FROM tbl_asignatura WHERE id_institucion = :tid ORDER BY nombre");
+$stmtAsig->execute([':tid' => $tid]);
+$asignaturas = $stmtAsig->fetchAll(PDO::FETCH_ASSOC);
+
+$stmtSec = $db->prepare("SELECT s.id, s.id_grado, s.nombre FROM tbl_seccion s WHERE s.id_institucion = :tid ORDER BY s.nombre");
+$stmtSec->execute([':tid' => $tid]);
+$secciones = $stmtSec->fetchAll(PDO::FETCH_ASSOC);
+
+// tbl_grado es un catálogo global (no tiene id_institucion poblado -- así
+// lo trata también gestionar_grados.php/gestionar_asignaturas.php). Se
+// agrupan las secciones por grado para la cascada Grado->Sección del modal
+// "Asignar Materias" (Fase 4: antes ese modal solo tenía un <select> plano
+// de Sección, sin filtrar por grado).
+$stmtGradosAux = $db->prepare("SELECT id, nombre FROM tbl_grado ORDER BY nombre");
+$stmtGradosAux->execute();
+$grados = $stmtGradosAux->fetchAll(PDO::FETCH_ASSOC);
+
+$secciones_por_grado = [];
+foreach ($secciones as $s) {
+    $secciones_por_grado[$s['id_grado']][] = ['id' => $s['id'], 'nombre' => $s['nombre']];
+}
 ?>
 <!DOCTYPE html>
 <html lang="es">
@@ -303,6 +365,7 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
             <a class="nav-link" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
             <a class="nav-link" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
+            <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </div>
@@ -409,9 +472,10 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (empty($profesores)): ?>
-                            <tr><td colspan="8" class="text-center py-5 text-muted"><i class="fas fa-inbox fa-3x mb-3 d-block"></i>No hay profesores registrados</td></tr>
-                            <?php else: ?>
+                            <?php // Sin fila manual de "sin datos": con DataTables, una tbody con una
+                            // sola fila de 1 <td colspan> frente a un thead de más columnas dispara
+                            // "Incorrect column count" (tn/18). Con tbody vacío, DataTables muestra
+                            // su propio mensaje localizado (idioma es-ES cargado abajo). ?>
                             <?php foreach ($profesores as $prof): ?>
                             <tr>
                                 <td>
@@ -458,7 +522,6 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
                                 </td>
                             </tr>
                             <?php endforeach; ?>
-                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -567,16 +630,9 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
                         <input type="hidden" name="id_profesor" id="asignar_id_profesor">
                         <div class="row g-3 mb-3">
                             <div class="col-md-6">
-                                <label class="form-label">Período</label>
-                                <select name="id_periodo" class="form-select">
-                                    <?php foreach ($periodos as $key => $val): ?>
-                                    <option value="<?= $key ?>"><?= $val ?></option>
-                                    <?php endforeach; ?>
-                                </select>
-                            </div>
-                            <div class="col-md-6">
                                 <label class="form-label">Año Lectivo</label>
                                 <input type="number" name="anno" class="form-control" value="<?= date('Y') ?>">
+                                <small class="text-muted">La asignación dura todo el año lectivo -- el estudiante verá esta clase durante todos los períodos, sin necesidad de reasignarla.</small>
                             </div>
                         </div>
                         <hr>
@@ -584,7 +640,7 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
                         <div id="asignaturasContainer">
                             <div class="asignatura-row mb-3 p-3 border rounded">
                                 <div class="row g-2">
-                                    <div class="col-md-5">
+                                    <div class="col-md-4">
                                         <label class="form-label">Asignatura</label>
                                         <select name="asignaturas[]" class="form-select select-asignatura">
                                             <option value="">Seleccionar</option>
@@ -593,13 +649,19 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
                                             <?php endforeach; ?>
                                         </select>
                                     </div>
-                                    <div class="col-md-5">
-                                        <label class="form-label">Sección</label>
-                                        <select name="secciones[]" class="form-select select-seccion">
+                                    <div class="col-md-3">
+                                        <label class="form-label">Grado</label>
+                                        <select class="form-select select-grado" onchange="actualizarSeccionesFila(this)">
                                             <option value="">Seleccionar</option>
-                                            <?php foreach ($secciones as $sec): ?>
-                                            <option value="<?= $sec['id'] ?>"><?= htmlspecialchars($sec['nombre']) ?></option>
+                                            <?php foreach ($grados as $g): ?>
+                                            <option value="<?= $g['id'] ?>"><?= htmlspecialchars($g['nombre']) ?></option>
                                             <?php endforeach; ?>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <label class="form-label">Sección</label>
+                                        <select name="secciones[]" class="form-select select-seccion" disabled>
+                                            <option value="">Elegir grado primero</option>
                                         </select>
                                     </div>
                                     <div class="col-md-2 d-flex align-items-end">
@@ -626,6 +688,51 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
     <script src="https://cdn.datatables.net/1.13.4/js/dataTables.bootstrap5.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
     <script>
+        // Secciones agrupadas por grado, para la cascada Grado->Sección del
+        // modal "Asignar Materias" (Fase 4 -- antes Sección era un único
+        // <select> plano sin relación al grado elegido).
+        const SECCIONES_POR_GRADO = <?= json_encode($secciones_por_grado, JSON_HEX_TAG | JSON_HEX_APOS) ?>;
+
+        // Repuebla el <select> de Sección de UNA fila específica del modal
+        // "Asignar Materias" a partir del <select> de Grado de esa misma
+        // fila (selectGrado). Cada fila es independiente porque las filas
+        // son dinámicas (addAsignatura()) -- no puede depender de un id fijo
+        // como hacía el patrón original de gestionar_asignaturas.php.
+        // Usa el DOM nativo primero (funciona aunque select2 no haya
+        // cargado desde el CDN) y solo intenta refrescar select2 si sí
+        // inicializó, igual que actualizarSeccionesPorGrado() en
+        // gestionar_asignaturas.php.
+        function actualizarSeccionesFila(selectGrado) {
+            const fila = selectGrado.closest('.asignatura-row');
+            const seccion = fila.querySelector('.select-seccion');
+            if (!seccion) return;
+            const idGrado = selectGrado.value;
+            const secciones = SECCIONES_POR_GRADO[idGrado] || [];
+
+            seccion.innerHTML = '';
+            if (!idGrado) {
+                seccion.add(new Option('Elegir grado primero', ''));
+                seccion.disabled = true;
+            } else if (secciones.length === 0) {
+                seccion.add(new Option('Este grado no tiene secciones', ''));
+                seccion.disabled = true;
+            } else {
+                seccion.add(new Option('Seleccionar', ''));
+                secciones.forEach(function(s) {
+                    seccion.add(new Option(s.nombre, s.id));
+                });
+                seccion.disabled = false;
+            }
+
+            try {
+                if (window.jQuery && jQuery.fn.select2 && jQuery(seccion).data('select2')) {
+                    jQuery(seccion).trigger('change');
+                }
+            } catch (e) {
+                console.error('No se pudo refrescar select2 en Sección:', e);
+            }
+        }
+
         $(document).ready(function() {
             $('#tablaProfesores').DataTable({
                 language: { url: '//cdn.datatables.net/plug-ins/1.13.4/i18n/es-ES.json' },
@@ -782,7 +889,7 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
             const html = `
             <div class="asignatura-row mb-3 p-3 border rounded">
                 <div class="row g-2">
-                    <div class="col-md-5">
+                    <div class="col-md-4">
                         <label class="form-label">Asignatura</label>
                         <select name="asignaturas[]" class="form-select select-asignatura">
                             <option value="">Seleccionar</option>
@@ -791,13 +898,19 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
                             <?php endforeach; ?>
                         </select>
                     </div>
-                    <div class="col-md-5">
-                        <label class="form-label">Sección</label>
-                        <select name="secciones[]" class="form-select select-seccion">
+                    <div class="col-md-3">
+                        <label class="form-label">Grado</label>
+                        <select class="form-select select-grado" onchange="actualizarSeccionesFila(this)">
                             <option value="">Seleccionar</option>
-                            <?php foreach ($secciones as $sec): ?>
-                            <option value="<?= $sec['id'] ?>"><?= htmlspecialchars($sec['nombre']) ?></option>
+                            <?php foreach ($grados as $g): ?>
+                            <option value="<?= $g['id'] ?>"><?= htmlspecialchars($g['nombre']) ?></option>
                             <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label">Sección</label>
+                        <select name="secciones[]" class="form-select select-seccion" disabled>
+                            <option value="">Elegir grado primero</option>
                         </select>
                     </div>
                     <div class="col-md-2 d-flex align-items-end">
@@ -807,9 +920,10 @@ $periodos = [1 => 'Primer Trimestre', 2 => 'Segundo Trimestre', 3 => 'Tercer Tri
             </div>`;
             $('#asignaturasContainer').append(html);
             initSelect2($('#asignaturasContainer .asignatura-row:last .select-asignatura'), $('#modalAsignarMaterias'));
+            initSelect2($('#asignaturasContainer .asignatura-row:last .select-grado'), $('#modalAsignarMaterias'));
             initSelect2($('#asignaturasContainer .asignatura-row:last .select-seccion'), $('#modalAsignarMaterias'));
         }
-        
+
         function removeAsignatura(btn) {
             $(btn).closest('.asignatura-row').remove();
         }

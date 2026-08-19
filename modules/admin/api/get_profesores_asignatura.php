@@ -11,26 +11,28 @@ if (!$id_asignatura) {
     exit('ID de asignatura requerido');
 }
 
+require_once __DIR__ . '/../../../config/TenantGuard.php';
 try {
+    $tid = TenantGuard::id();
     $db = (new Database())->getConnection();
-    
-    $stmt = $db->prepare("SELECT 
-        per.primer_nombre, 
-        per.primer_apellido, 
+
+    $stmt = $db->prepare("SELECT
+        per.primer_nombre,
+        per.primer_apellido,
         p.especialidad,
-        s.nombre as seccion, 
-        g.nombre as grado, 
-        ad.id_periodo, 
+        s.nombre as seccion,
+        g.nombre as grado,
+        ad.id_periodo,
         ad.anno
         FROM tbl_asignacion_docente ad
         JOIN tbl_profesor p ON ad.id_profesor = p.id
         JOIN tbl_persona per ON p.id_persona = per.id
         JOIN tbl_seccion s ON ad.id_seccion = s.id
         JOIN tbl_grado g ON s.id_grado = g.id
-        WHERE ad.id_asignatura = :id
+        WHERE ad.id_asignatura = :id AND p.id_institucion = :tid
         ORDER BY per.primer_apellido, per.primer_nombre");
-    
-    $stmt->execute([':id' => $id_asignatura]);
+
+    $stmt->execute([':id' => $id_asignatura, ':tid' => $tid]);
     $profesores = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
     $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4 => '4to Trimestre'];

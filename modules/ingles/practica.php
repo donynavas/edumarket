@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id'])) {
@@ -12,18 +13,20 @@ $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 $rol = $_SESSION['rol'];
+$tid = TenantGuard::id();
 
 // ===== OBTENER DATOS DEL USUARIO =====
 $id_estudiante = 0;
 $nombre_usuario = 'Usuario';
 
 if ($rol == 'estudiante') {
-    $query = "SELECT e.id as id_estudiante, p.primer_nombre 
+    $query = "SELECT e.id as id_estudiante, p.primer_nombre
               FROM tbl_estudiante e
               JOIN tbl_persona p ON e.id_persona = p.id
-              WHERE p.id_usuario = :user_id";
+              WHERE p.id_usuario = :user_id AND e.id_institucion = :tid";
     $stmt = $db->prepare($query);
     $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);
     $id_estudiante = $estudiante['id_estudiante'] ?? 0;

@@ -17,6 +17,8 @@ if (!$id) {
     exit;
 }
 
+require_once __DIR__ . '/../../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $db = (new Database())->getConnection();
 
 try {
@@ -29,7 +31,7 @@ try {
               FROM tbl_profesor p
               JOIN tbl_persona per ON p.id_persona = per.id
               JOIN tbl_usuario u ON per.id_usuario = u.id
-              WHERE p.id = :id";
+              WHERE p.id = :id AND p.id_institucion = :tid";
     } else {
         $q = "SELECT p.id, per.primer_nombre, per.segundo_nombre, per.primer_apellido, per.segundo_apellido,
               per.dui, per.fecha_nacimiento, per.sexo, per.nacionalidad, per.direccion,
@@ -39,11 +41,12 @@ try {
               FROM tbl_profesor p
               JOIN tbl_persona per ON p.id_persona = per.id
               JOIN tbl_usuario u ON per.id_usuario = u.id
-              WHERE p.id = :id";
+              WHERE p.id = :id AND p.id_institucion = :tid";
     }
-    
+
     $stmt = $db->prepare($q);
     $stmt->bindParam(':id', $id, PDO::PARAM_INT);
+    $stmt->bindParam(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $data = $stmt->fetch(PDO::FETCH_ASSOC);
     

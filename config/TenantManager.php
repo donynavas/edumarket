@@ -28,9 +28,13 @@ class TenantManager {
             return self::$currentTenant;
         }
 
-        // ── MODO SUBDOMINIO (producción) ─────────────────────────────
-        // Requiere al menos 3 partes: sub.dominio.tld
-        if (count($parts) >= 3) {
+        // ── MODO SUBDOMINIO ────────────────────────────────────────────
+        // Producción: sub.dominio.tld (3+ partes).
+        // Desarrollo local: sub.localhost (2 partes, ej. sanjose.localhost,
+        // edumarket.localhost) — sin este caso, cualquier prueba de tenant
+        // por subdominio en local caía siempre en el tenant por defecto.
+        $esLocalDev = (end($parts) === 'localhost');
+        if (count($parts) >= 3 || ($esLocalDev && count($parts) === 2)) {
             $subdomain = strtolower($parts[0]);
             // Ignorar www
             if ($subdomain !== 'www') {

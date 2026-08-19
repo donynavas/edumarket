@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea admin o director
 if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['rol'] != 'director')) {
@@ -11,6 +12,7 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['r
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // ===== FILTROS =====
 $filtro_anno = $_GET['anno'] ?? date('Y');
@@ -25,44 +27,53 @@ $filtro_tipo = $_GET['tipo'] ?? 'resumen'; // resumen, academico, asistencia, co
 $query = "SELECT COUNT(*) as total FROM tbl_estudiante e
           JOIN tbl_persona p ON e.id_persona = p.id
           JOIN tbl_usuario u ON p.id_usuario = u.id
-          WHERE u.estado = 1";
-$total_estudiantes = $db->query($query)->fetchColumn();
+          WHERE u.estado = 1 AND e.id_institucion = :tid";
+$stmt = $db->prepare($query);
+$stmt->execute([':tid' => $tid]);
+$total_estudiantes = $stmt->fetchColumn();
 
 // Total de profesores activos
 $query = "SELECT COUNT(*) as total FROM tbl_profesor p
           JOIN tbl_persona per ON p.id_persona = per.id
           JOIN tbl_usuario u ON per.id_usuario = u.id
-          WHERE u.estado = 1";
-$total_profesores = $db->query($query)->fetchColumn();
-
-// Total de matrículas activas este año
-$query = "SELECT COUNT(*) as total FROM tbl_matricula 
-          WHERE anno = :anno AND estado = 'activo'";
+          WHERE u.estado = 1 AND p.id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute([':anno' => $filtro_anno]);
+$stmt->execute([':tid' => $tid]);
+$total_profesores = $stmt->fetchColumn();
+
+// Total de matrículas activas este año. tbl_matricula no tiene columna
+// id_institucion; se acota por institución vía tbl_estudiante.
+$query = "SELECT COUNT(*) as total FROM tbl_matricula m
+          JOIN tbl_estudiante e ON m.id_estudiante = e.id
+          WHERE m.anno = :anno AND m.estado = 'activo' AND e.id_institucion = :tid";
+$stmt = $db->prepare($query);
+$stmt->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $total_matriculas = $stmt->fetchColumn();
 
 // Promedio general de notas
-$query = "SELECT AVG(ea.nota_obtenida) as promedio 
+$query = "SELECT AVG(ea.nota_obtenida) as promedio
           FROM tbl_entrega_actividad ea
           JOIN tbl_actividad act ON ea.id_actividad = act.id
           JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
-          WHERE ad.anno = :anno 
-          AND ea.nota_obtenida IS NOT NULL 
-          AND ea.estado_entrega = 'calificado'";
+          JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
+          WHERE ad.anno = :anno
+          AND ea.nota_obtenida IS NOT NULL
+          AND ea.estado_entrega = 'calificado'
+          AND asig.id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute([':anno' => $filtro_anno]);
+$stmt->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $promedio_general = round($stmt->fetchColumn() ?? 0, 2);
 
 // Asistencia promedio
-$query = "SELECT 
+$query = "SELECT
           COUNT(*) as total_registros,
           SUM(CASE WHEN a.estado = 'presente' THEN 1 ELSE 0 END) as presentes
           FROM tbl_asistencia a
           JOIN tbl_matricula m ON a.id_matricula = m.id
-          WHERE m.anno = :anno";
+          JOIN tbl_estudiante e ON m.id_estudiante = e.id
+          WHERE m.anno = :anno AND e.id_institucion = :tid";
 $stmt = $db->prepare($query);
-$stmt->execute([':anno' => $filtro_anno]);
+$stmt->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $asistencia_data = $stmt->fetch(PDO::FETCH_ASSOC);
 $porcentaje_asistencia = $asistencia_data['total_registros'] > 0 
     ? round(($asistencia_data['presentes'] / $asistencia_data['total_registros']) * 100, 1) 
@@ -76,11 +87,11 @@ $query = "SELECT g.nombre as grado, COUNT(DISTINCT e.id) as cantidad
           JOIN tbl_matricula m ON e.id = m.id_estudiante
           JOIN tbl_seccion s ON m.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
-          WHERE m.anno = :anno AND m.estado = 'activo'
+          WHERE m.anno = :anno AND m.estado = 'activo' AND e.id_institucion = :tid
           GROUP BY g.id, g.nombre
           ORDER BY g.nivel, g.nombre";
 $stmt = $db->prepare($query);
-$stmt->execute([':anno' => $filtro_anno]);
+$stmt->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $estudiantes_por_grado = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Rendimiento por materia
@@ -92,18 +103,19 @@ $query = "SELECT
           JOIN tbl_actividad act ON ea.id_actividad = act.id
           JOIN tbl_asignacion_docente ad ON act.id_asignacion_docente = ad.id
           JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
-          WHERE ad.anno = :anno 
-          AND ea.nota_obtenida IS NOT NULL 
+          WHERE ad.anno = :anno
+          AND ea.nota_obtenida IS NOT NULL
           AND ea.estado_entrega = 'calificado'
+          AND asig.id_institucion = :tid
           GROUP BY asig.id, asig.nombre
           ORDER BY promedio DESC
           LIMIT 10";
 $stmt = $db->prepare($query);
-$stmt->execute([':anno' => $filtro_anno]);
+$stmt->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $rendimiento_materias = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // Asistencia por sección
-$query = "SELECT 
+$query = "SELECT
           s.nombre as seccion,
           g.nombre as grado,
           COUNT(*) as total_registros,
@@ -112,11 +124,11 @@ $query = "SELECT
           JOIN tbl_matricula m ON a.id_matricula = m.id
           JOIN tbl_seccion s ON m.id_seccion = s.id
           JOIN tbl_grado g ON s.id_grado = g.id
-          WHERE m.anno = :anno
+          WHERE m.anno = :anno AND s.id_institucion = :tid
           GROUP BY s.id, s.nombre, g.nombre
           ORDER BY g.nombre, s.nombre";
 $stmt = $db->prepare($query);
-$stmt->execute([':anno' => $filtro_anno]);
+$stmt->execute([':anno' => $filtro_anno, ':tid' => $tid]);
 $asistencia_por_seccion = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 // ===== LISTADO DETALLADO (según filtro) =====
@@ -141,10 +153,11 @@ if ($filtro_tipo == 'academico') {
               JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
               WHERE m.anno = :anno
               AND ea.nota_obtenida IS NOT NULL
-              AND ea.estado_entrega = 'calificado'";
-    
-    $params = [':anno' => $filtro_anno];
-    
+              AND ea.estado_entrega = 'calificado'
+              AND e.id_institucion = :tid";
+
+    $params = [':anno' => $filtro_anno, ':tid' => $tid];
+
     if ($filtro_periodo) {
         $query .= " AND ad.id_periodo = :periodo";
         $params[':periodo'] = $filtro_periodo;
@@ -181,10 +194,10 @@ if ($filtro_tipo == 'academico') {
               JOIN tbl_seccion s ON m.id_seccion = s.id
               JOIN tbl_grado g ON s.id_grado = g.id
               LEFT JOIN tbl_asistencia a ON m.id = a.id_matricula
-              WHERE m.anno = :anno";
-    
-    $params = [':anno' => $filtro_anno];
-    
+              WHERE m.anno = :anno AND e.id_institucion = :tid";
+
+    $params = [':anno' => $filtro_anno, ':tid' => $tid];
+
     if ($filtro_periodo) {
         $query .= " AND a.id_periodo = :periodo";
         $params[':periodo'] = $filtro_periodo;
@@ -209,7 +222,7 @@ if ($filtro_tipo == 'academico') {
     
 } elseif ($filtro_tipo == 'comportamiento') {
     // Reporte de registro anecdótico/comportamiento
-    $query = "SELECT 
+    $query = "SELECT
               p.primer_nombre, p.primer_apellido,
               g.nombre as grado, s.nombre as seccion,
               ra.fecha, ra.descripcion, ra.tipo,
@@ -220,10 +233,11 @@ if ($filtro_tipo == 'academico') {
               JOIN tbl_matricula m ON e.id = m.id_estudiante
               JOIN tbl_seccion s ON m.id_seccion = s.id
               JOIN tbl_grado g ON s.id_grado = g.id
-              JOIN tbl_persona per ON ra.id_registro_por = per.id
-              WHERE m.anno = :anno";
-    
-    $params = [':anno' => $filtro_anno];
+              LEFT JOIN tbl_profesor prof ON ra.id_profesor = prof.id
+              LEFT JOIN tbl_persona per ON prof.id_persona = per.id
+              WHERE m.anno = :anno AND e.id_institucion = :tid";
+
+    $params = [':anno' => $filtro_anno, ':tid' => $tid];
     
     if ($filtro_grado) {
         $query .= " AND g.id = :grado";
@@ -246,8 +260,10 @@ if ($filtro_tipo == 'academico') {
 $query = "SELECT id, nombre FROM tbl_grado ORDER BY nivel, nombre";
 $grados = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
 
-$query = "SELECT id, nombre FROM tbl_seccion ORDER BY nombre";
-$secciones = $db->query($query)->fetchAll(PDO::FETCH_ASSOC);
+$query = "SELECT id, nombre FROM tbl_seccion WHERE id_institucion = :tid ORDER BY nombre";
+$stmt = $db->prepare($query);
+$stmt->execute([':tid' => $tid]);
+$secciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
 $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4 => '4to Trimestre'];
 $anios = range(date('Y') - 3, date('Y') + 1);

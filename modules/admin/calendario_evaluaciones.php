@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea admin o director
 if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['rol'] != 'director')) {
@@ -11,6 +12,7 @@ if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['r
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // ===== FILTROS =====
 $filtro_anno = $_GET['anno'] ?? date('Y');
@@ -26,16 +28,23 @@ $filtro_fecha_fin = $_GET['fecha_fin'] ?? date('Y-m-t');
 $query_grados = "SELECT id, nombre FROM tbl_grado ORDER BY nivel, nombre";
 $grados = $db->query($query_grados)->fetchAll(PDO::FETCH_ASSOC);
 
-$query_secciones = "SELECT s.id, s.nombre, g.nombre as grado_nombre 
-                    FROM tbl_seccion s JOIN tbl_grado g ON s.id_grado = g.id 
+$query_secciones = "SELECT s.id, s.nombre, g.nombre as grado_nombre
+                    FROM tbl_seccion s JOIN tbl_grado g ON s.id_grado = g.id
+                    WHERE s.id_institucion = :tid
                     ORDER BY g.nombre, s.nombre";
-$secciones = $db->query($query_secciones)->fetchAll(PDO::FETCH_ASSOC);
+$stmt_sec = $db->prepare($query_secciones);
+$stmt_sec->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt_sec->execute();
+$secciones = $stmt_sec->fetchAll(PDO::FETCH_ASSOC);
 
-$query_profesores = "SELECT p.id, per.primer_nombre, per.primer_apellido 
-                     FROM tbl_profesor p JOIN tbl_persona per ON p.id_persona = per.id 
-                     JOIN tbl_usuario u ON per.id_usuario = u.id 
-                     WHERE u.estado = 1 ORDER BY per.primer_apellido";
-$profesores = $db->query($query_profesores)->fetchAll(PDO::FETCH_ASSOC);
+$query_profesores = "SELECT p.id, per.primer_nombre, per.primer_apellido
+                     FROM tbl_profesor p JOIN tbl_persona per ON p.id_persona = per.id
+                     JOIN tbl_usuario u ON per.id_usuario = u.id
+                     WHERE u.estado = 1 AND p.id_institucion = :tid ORDER BY per.primer_apellido";
+$stmt_prof = $db->prepare($query_profesores);
+$stmt_prof->bindValue(':tid', $tid, PDO::PARAM_INT);
+$stmt_prof->execute();
+$profesores = $stmt_prof->fetchAll(PDO::FETCH_ASSOC);
 
 $periodos = [1 => '1er Trimestre', 2 => '2do Trimestre', 3 => '3er Trimestre', 4 => '4to Trimestre'];
 
@@ -55,9 +64,9 @@ $query = "SELECT
     JOIN tbl_seccion s ON ad.id_seccion = s.id
     JOIN tbl_grado g ON s.id_grado = g.id
     LEFT JOIN tbl_entrega_actividad ea ON act.id = ea.id_actividad
-    WHERE ad.anno = :anno";
+    WHERE ad.anno = :anno AND asig.id_institucion = :tid";
 
-$params = [':anno' => $filtro_anno];
+$params = [':anno' => $filtro_anno, ':tid' => $tid];
 
 // Filtros dinámicos
 if ($filtro_periodo) { $query .= " AND ad.id_periodo = :periodo"; $params[':periodo'] = $filtro_periodo; }
@@ -333,7 +342,6 @@ foreach ($evaluaciones as $eval) {
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
-                    <a href="#" id="m_link_profesor" class="btn btn-outline-primary"><i class="fas fa-external-link-alt"></i> Ir a Aula del Profesor</a>
                 </div>
             </div>
         </div>
@@ -374,7 +382,6 @@ foreach ($evaluaciones as $eval) {
                     document.getElementById('m_entregas').textContent = d.entregas;
                     document.getElementById('m_calificadas').textContent = d.calificadas;
                     document.getElementById('m_nota_max').textContent = d.nota_maxima;
-                    document.getElementById('m_link_profesor').href = `../profesor/aula_virtual.php?asignacion=${info.event.id}`; // Ajusta ruta si es necesario
                     new bootstrap.Modal(document.getElementById('modalDetalle')).show();
                 },
                 height: 'auto'

@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar autenticación
 if (!isset($_SESSION['user_id'])) {
@@ -12,6 +13,7 @@ $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
 $rol = $_SESSION['rol'];
+$tid = TenantGuard::id();
 
 // Obtener datos del usuario
 $nombre_usuario = 'Usuario';
@@ -22,9 +24,10 @@ if ($rol == 'estudiante') {
     $query = "SELECT e.id as id_estudiante, p.primer_nombre, p.primer_apellido
               FROM tbl_estudiante e
               JOIN tbl_persona p ON e.id_persona = p.id
-              WHERE p.id_usuario = :user_id";
+              WHERE p.id_usuario = :user_id AND e.id_institucion = :tid";
     $stmt = $db->prepare($query);
     $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);
     $id_estudiante = $estudiante['id_estudiante'] ?? 0;
@@ -33,9 +36,10 @@ if ($rol == 'estudiante') {
     $query = "SELECT p.id as id_profesor, per.primer_nombre, per.primer_apellido
               FROM tbl_profesor p
               JOIN tbl_persona per ON p.id_persona = per.id
-              WHERE per.id_usuario = :user_id";
+              WHERE per.id_usuario = :user_id AND p.id_institucion = :tid";
     $stmt = $db->prepare($query);
     $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $profesor = $stmt->fetch(PDO::FETCH_ASSOC);
     $id_profesor = $profesor['id_profesor'] ?? 0;
@@ -78,6 +82,9 @@ if ($rol == 'estudiante' && $id_estudiante) {
     // Asignaciones pendientes
     $asignaciones = [];
     try {
+        // tbl_ingles_asignacion no tiene columna id_institucion; no hace
+        // falta filtrarla aparte porque $id_estudiante ya viene de una
+        // consulta anterior filtrada por tbl_estudiante.id_institucion.
         $query = "SELECT a.*, l.titulo as leccion_titulo, c.nombre as curso_nombre
                   FROM tbl_ingles_asignacion a
                   LEFT JOIN tbl_ingles_leccion l ON a.id_leccion = l.id
@@ -91,7 +98,7 @@ if ($rol == 'estudiante' && $id_estudiante) {
     } catch (Exception $e) {
         error_log("Error asignaciones: " . $e->getMessage());
     }
-    
+
     // Últimas lecciones
     try {
         $query = "SELECT p.*, l.titulo, l.tipo, c.nombre as curso_nombre
@@ -111,6 +118,8 @@ if ($rol == 'estudiante' && $id_estudiante) {
 
 // ===== ESTADÍSTICAS PARA PROFESOR =====
 if ($rol == 'profesor' && $id_profesor) {
+    // tbl_ingles_asignacion no tiene columna id_institucion; id_profesor ya
+    // está tenant-verificado (resuelto arriba vía p.id_institucion).
     $query = "SELECT COUNT(DISTINCT id_estudiante) as total_estudiantes
               FROM tbl_ingles_asignacion
               WHERE id_profesor = :id_profesor";
@@ -118,8 +127,8 @@ if ($rol == 'profesor' && $id_profesor) {
     $stmt->bindValue(':id_profesor', $id_profesor, PDO::PARAM_INT);
     $stmt->execute();
     $stats = $stmt->fetch(PDO::FETCH_ASSOC) ?? $stats;
-    
-    $query = "SELECT * FROM tbl_ingles_asignacion 
+
+    $query = "SELECT * FROM tbl_ingles_asignacion
               WHERE id_profesor = :id_profesor AND estado IN ('pendiente', 'en-progreso')
               ORDER BY fecha_asignacion DESC";
     $stmt = $db->prepare($query);

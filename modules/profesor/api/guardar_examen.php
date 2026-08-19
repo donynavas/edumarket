@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../../config/database.php';
+require_once __DIR__ . '/../../../config/TenantGuard.php';
 
 header('Content-Type: application/json');
 
@@ -10,12 +11,27 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'profesor') {
 }
 
 $db = (new Database())->getConnection();
+$tid = TenantGuard::id();
+$user_id = $_SESSION['user_id'];
 
 try {
     $db->beginTransaction();
-    
-    $id_asignacion = $_POST['id_asignacion'];
-    $titulo = trim($_POST['titulo']);
+
+    // Resolver el profesor autenticado dentro de su institución
+    $stmtProf = $db->prepare("SELECT p.id FROM tbl_profesor p
+                              JOIN tbl_persona per ON p.id_persona = per.id
+                              WHERE per.id_usuario = :uid AND p.id_institucion = :tid");
+    $stmtProf->execute([':uid' => $user_id, ':tid' => $tid]);
+    $id_profesor = $stmtProf->fetchColumn();
+    if (!$id_profesor) {
+        throw new Exception('Perfil de profesor no encontrado');
+    }
+
+    $id_asignacion = (int) $_POST['id_asignacion'];
+    $titulo = trim($_POST['titulo'] ?? '');
+    if ($titulo === '') {
+        throw new Exception('El título del examen es obligatorio');
+    }
     $descripcion = $_POST['descripcion'] ?? '';
     $instrucciones = $_POST['instrucciones'] ?? '';
     $duracion = $_POST['duracion_minutos'] ?? 60;
@@ -26,11 +42,31 @@ try {
     $mezclar_preguntas = isset($_POST['mezclar_preguntas']) ? 1 : 0;
     $mezclar_opciones = isset($_POST['mezclar_opciones']) ? 1 : 0;
     $mostrar_resultados = isset($_POST['mostrar_resultados']) ? 1 : 0;
-    
+
+    // La asignación docente indicada DEBE pertenecer a este profesor.
+    // tbl_asignacion_docente no tiene columna id_institucion; id_profesor
+    // ya está tenant-verificado (se resolvió arriba vía p.id_institucion).
+    $stmtAsig = $db->prepare("SELECT id FROM tbl_asignacion_docente WHERE id = :id AND id_profesor = :prof");
+    $stmtAsig->execute([':id' => $id_asignacion, ':prof' => $id_profesor]);
+    if ($stmtAsig->rowCount() === 0) {
+        throw new Exception('No tiene permiso para usar esta asignación');
+    }
+
     // Guardar examen
     if (!empty($_POST['examen_id'])) {
+        $examen_id = (int) $_POST['examen_id'];
+
+        // Verificar que el examen a editar pertenece a esta asignación.
+        // tbl_examen tampoco tiene columna id_institucion.
+        TenantGuard::assertOwner($db, 'tbl_examen', $examen_id);
+        $stmtCheckExamen = $db->prepare("SELECT id FROM tbl_examen WHERE id = :id AND id_asignacion_docente = :asig");
+        $stmtCheckExamen->execute([':id' => $examen_id, ':asig' => $id_asignacion]);
+        if ($stmtCheckExamen->rowCount() === 0) {
+            throw new Exception('No tiene permiso para editar este examen');
+        }
+
         // Actualizar
-        $stmt = $db->prepare("UPDATE tbl_examen SET 
+        $stmt = $db->prepare("UPDATE tbl_examen SET
             titulo = :titulo, descripcion = :descripcion, instrucciones = :instrucciones,
             duracion_minutos = :duracion, nota_maxima = :nota_maxima,
             fecha_programada = :fecha_prog, fecha_limite = :fecha_limite,
@@ -43,15 +79,16 @@ try {
             ':fecha_prog' => $fecha_programada, ':fecha_limite' => $fecha_limite,
             ':intentos' => $intento_maximo, ':mezclar_preg' => $mezclar_preguntas,
             ':mezclar_opt' => $mezclar_opciones, ':mostrar_res' => $mostrar_resultados,
-            ':id' => $_POST['examen_id'], ':asig' => $id_asignacion
+            ':id' => $examen_id, ':asig' => $id_asignacion
         ]);
-        $examen_id = $_POST['examen_id'];
-        
-        // Eliminar preguntas existentes
+
+        // Eliminar preguntas existentes (el examen ya fue verificado como propio)
         $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id")->execute([':id' => $examen_id]);
     } else {
-        // Crear nuevo
-        $stmt = $db->prepare("INSERT INTO tbl_examen 
+        // Crear nuevo. tbl_examen no tiene columna id_institucion (se
+        // confirmó contra el esquema real) — insertarla aquí rompía CADA
+        // creación de examen nuevo con "Unknown column 'id_institucion'".
+        $stmt = $db->prepare("INSERT INTO tbl_examen
             (id_asignacion_docente, titulo, descripcion, instrucciones, duracion_minutos, nota_maxima,
              fecha_programada, fecha_limite, intento_maximo, mezclar_preguntas, mezclar_opciones, mostrar_resultados, estado)
             VALUES (:asig, :titulo, :descripcion, :instrucciones, :duracion, :nota_maxima,

@@ -19,12 +19,13 @@ if (!$id) {
     exit;
 }
 
+require_once __DIR__ . '/../../../config/TenantGuard.php';
 try {
+    $tid = TenantGuard::id();
     $db = (new Database())->getConnection();
-    
+
     if ($action === 'editar') {
-        // ✅ ELIMINADA la columna 'area' que no existe
-        $q = "SELECT id, nombre, codigo FROM tbl_asignatura WHERE id = :id";
+        $q = "SELECT id, nombre, codigo FROM tbl_asignatura WHERE id = :id AND id_institucion = :tid";
     } else {
         $q = "SELECT a.id, a.nombre, a.codigo,
                      COUNT(DISTINCT ad.id) as total_asignaciones,
@@ -33,12 +34,13 @@ try {
               FROM tbl_asignatura a
               LEFT JOIN tbl_asignacion_docente ad ON a.id = ad.id_asignatura
               LEFT JOIN tbl_actividad act ON ad.id = act.id_asignacion_docente
-              WHERE a.id = :id
+              WHERE a.id = :id AND a.id_institucion = :tid
               GROUP BY a.id";
     }
-    
+
     $stmt = $db->prepare($q);
     $stmt->bindParam(':id', $id, PDO::PARAM_INT);
+    $stmt->bindParam(':tid', $tid, PDO::PARAM_INT);
     $stmt->execute();
     $data = $stmt->fetch(PDO::FETCH_ASSOC);
     

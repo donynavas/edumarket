@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once __DIR__ . '/../../config/database.php';
+require_once __DIR__ . '/../../config/TenantGuard.php';
 
 // Verificar que sea estudiante
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
@@ -11,12 +12,13 @@ if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'estudiante') {
 $database = new Database();
 $db = $database->getConnection();
 $user_id = $_SESSION['user_id'];
+$tid = TenantGuard::id();
 
 // Obtener datos completos del estudiante
-$query = "SELECT 
+$query = "SELECT
           e.id as id_estudiante, e.nie, e.estado_familiar, e.discapacidad, e.trabaja,
           p.primer_nombre, p.segundo_nombre, p.primer_apellido, p.segundo_apellido,
-          p.dui, p.fecha_nacimiento, p.sexo, p.nacionalidad, p.direccion, 
+          p.dui, p.fecha_nacimiento, p.sexo, p.nacionalidad, p.direccion,
           p.telefono_fijo, p.celular, p.email,
           g.id as id_grado, g.nombre as grado_nombre, g.nivel, g.nota_minima_aprobacion,
           s.id as id_seccion, s.nombre as seccion_nombre,
@@ -30,11 +32,13 @@ $query = "SELECT
           JOIN tbl_grado g ON s.id_grado = g.id
           WHERE p.id_usuario = :user_id
           AND m.estado = 'activo'
+          AND e.id_institucion = :tid
           ORDER BY m.anno DESC, m.id_periodo DESC
           LIMIT 1";
 
 $stmt = $db->prepare($query);
 $stmt->bindValue(':user_id', $user_id, PDO::PARAM_INT);
+$stmt->bindValue(':tid', $tid, PDO::PARAM_INT);
 $stmt->execute();
 $estudiante = $stmt->fetch(PDO::FETCH_ASSOC);
 

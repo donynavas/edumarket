@@ -6,6 +6,8 @@ if (!isset($_SESSION['user_id'])) {
     exit('Acceso denegado');
 }
 
+require_once __DIR__ . '/../../config/TenantGuard.php';
+$tid = TenantGuard::id();
 $database = new Database();
 $db = $database->getConnection();
 
@@ -17,11 +19,12 @@ $query = "SELECT s.*, g.nombre as grado_nombre, g.nivel,
           FROM tbl_seccion s
           JOIN tbl_grado g ON s.id_grado = g.id
           LEFT JOIN tbl_matricula m ON s.id = m.id_seccion AND m.estado = 'activo'
-          WHERE s.id = :id
+          WHERE s.id = :id AND s.id_institucion = :tid
           GROUP BY s.id";
 
 $stmt = $db->prepare($query);
 $stmt->bindParam(':id', $id);
+$stmt->bindParam(':tid', $tid);
 $stmt->execute();
 $seccion = $stmt->fetch(PDO::FETCH_ASSOC);
 
