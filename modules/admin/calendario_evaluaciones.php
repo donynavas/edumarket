@@ -171,6 +171,7 @@ foreach ($evaluaciones as $eval) {
             <a class="nav-link" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
             <a class="nav-link active" href="calendario_evaluaciones.php"><i class="fas fa-calendar-alt"></i> Calendario Eval.</a>
+            <a class="nav-link" href="manual_convivencia.php"><i class="fas fa-handshake"></i> Convivencia Escolar</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </div>

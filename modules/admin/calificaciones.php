@@ -538,6 +538,9 @@ if (!empty($promedios_validos)) {
             <a class="nav-link" href="reporte_notas.php">
                 <i class="fas fa-chart-bar"></i> Reportes
             </a>
+            <a class="nav-link" href="manual_convivencia.php">
+                <i class="fas fa-handshake"></i> Convivencia Escolar
+            </a>
             <a class="nav-link" href="../../logout.php">
                 <i class="fas fa-sign-out-alt"></i> Cerrar Sesión
             </a>

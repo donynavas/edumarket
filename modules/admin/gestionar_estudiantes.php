@@ -382,6 +382,7 @@ $secciones = $stmtS->fetchAll(PDO::FETCH_ASSOC);
             <a class="nav-link" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
             <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
             <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
+            <a class="nav-link" href="manual_convivencia.php"><i class="fas fa-handshake"></i> Convivencia Escolar</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Cerrar Sesión</a>
         </nav>
     </div>

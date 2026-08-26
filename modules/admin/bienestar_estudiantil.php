@@ -247,6 +247,7 @@ $estudiantes = $stmt_est->fetchAll(PDO::FETCH_ASSOC);
             <a class="nav-link" href="../../index.php"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
             <a class="nav-link active" href="bienestar_estudiantil.php"><i class="fas fa-heart"></i> Bienestar</a>
             <a class="nav-link" href="gestionar_estudiantes.php"><i class="fas fa-user-graduate"></i> Estudiantes</a>
+            <a class="nav-link" href="manual_convivencia.php"><i class="fas fa-handshake"></i> Convivencia Escolar</a>
             <a class="nav-link" href="../../logout.php"><i class="fas fa-sign-out-alt"></i> Salir</a>
         </nav>
     </div>
