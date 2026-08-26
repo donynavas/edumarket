@@ -65,6 +65,7 @@ $filtro_materia = $_GET['materia'] ?? '';
 // simple JOIN a la vista reemplaza el UNION ALL manual que tenía antes
 // esta consulta.
 $query_notas = "SELECT
+    act.id AS id_actividad,
     act.titulo,
     act.nota_maxima,
     act.tipo,
@@ -100,6 +101,19 @@ foreach ($params as $key => $value) {
 }
 $stmt_notas->execute();
 $notas = $stmt_notas->fetchAll(PDO::FETCH_ASSOC);
+
+// ===== ACTIVIDADES CON RÚBRICA (para el link "Ver rúbrica") =====
+// Batch-check en vez de una consulta por fila -- ver ver_rubrica.php para
+// el detalle completo (con verificación de propiedad) que se trae recién
+// al abrir el modal.
+$actividades_con_rubrica = [];
+if ($notas) {
+    $idsActividades = array_unique(array_column($notas, 'id_actividad'));
+    $in = implode(',', array_fill(0, count($idsActividades), '?'));
+    $stmtRubNotas = $db->prepare("SELECT id_actividad FROM tbl_rubrica WHERE id_actividad IN ($in)");
+    $stmtRubNotas->execute($idsActividades);
+    $actividades_con_rubrica = array_flip($stmtRubNotas->fetchAll(PDO::FETCH_COLUMN));
+}
 
 // ===== ESTADÍSTICAS Y PROMEDIOS =====
 $suma_notas = 0;
@@ -327,6 +341,11 @@ $materias = $stmt_materias->fetchAll(PDO::FETCH_ASSOC);
                                 <small class="text-muted">
                                     <?= htmlspecialchars($nota['observacion_docente'] ?? '') ?>
                                 </small>
+                                <?php if ($nota['estado_entrega'] == 'calificado' && isset($actividades_con_rubrica[$nota['id_actividad']])): ?>
+                                <br><button type="button" class="btn btn-sm btn-outline-primary mt-1" onclick="verRubrica(<?= (int) $nota['id_actividad'] ?>)">
+                                    <i class="fas fa-th"></i> Ver rúbrica
+                                </button>
+                                <?php endif; ?>
                             </td>
                         </tr>
                         <?php endforeach; ?>
@@ -337,11 +356,67 @@ $materias = $stmt_materias->fetchAll(PDO::FETCH_ASSOC);
         </div>
     </main>
 
+    <!-- Modal Ver Rúbrica (solo lectura) -->
+    <div class="modal fade" id="modalVerRubrica" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="verRubricaTitulo"><i class="fas fa-th"></i> Detalle de la rúbrica</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="verRubricaContenido">
+                    <p class="text-muted">Cargando...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         document.getElementById('sidebarToggle')?.addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('active');
         });
+
+        function verRubrica(idActividad) {
+            const modalEl = document.getElementById('modalVerRubrica');
+            const cuerpo = document.getElementById('verRubricaContenido');
+            cuerpo.innerHTML = '<p class="text-muted">Cargando...</p>';
+            new bootstrap.Modal(modalEl).show();
+
+            fetch('api/ver_rubrica.php?id_actividad=' + encodeURIComponent(idActividad))
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.success) {
+                        cuerpo.innerHTML = '<p class="text-danger">No se pudo cargar la rúbrica.</p>';
+                        return;
+                    }
+                    document.getElementById('verRubricaTitulo').innerHTML = '<i class="fas fa-th"></i> ' + escapeHtmlNotas(data.titulo);
+                    let html = `<div class="alert alert-light border d-flex justify-content-between">
+                        <strong>Nota total</strong>
+                        <span>${data.nota_obtenida !== null ? data.nota_obtenida.toFixed(2) : '-'} / ${data.nota_maxima}</span>
+                    </div>`;
+                    if (!data.detalle.length) {
+                        html += '<p class="text-muted">Todavía no hay detalle por criterio para esta calificación.</p>';
+                    } else {
+                        html += '<table class="table table-bordered table-sm"><thead class="table-light"><tr><th>Criterio</th><th>Nivel</th><th>Puntaje</th><th>Comentario</th></tr></thead><tbody>';
+                        data.detalle.forEach(d => {
+                            html += `<tr>
+                                <td><strong>${escapeHtmlNotas(d.criterio)}</strong>${d.criterio_descripcion ? '<br><small class="text-muted">' + escapeHtmlNotas(d.criterio_descripcion) + '</small>' : ''}</td>
+                                <td>${escapeHtmlNotas(d.nivel)}</td>
+                                <td>${parseFloat(d.puntaje_otorgado).toFixed(2)}</td>
+                                <td>${d.comentario_criterio ? escapeHtmlNotas(d.comentario_criterio) : '<span class="text-muted">—</span>'}</td>
+                            </tr>`;
+                        });
+                        html += '</tbody></table>';
+                    }
+                    cuerpo.innerHTML = html;
+                })
+                .catch(() => { cuerpo.innerHTML = '<p class="text-danger">Error de conexión al cargar la rúbrica.</p>'; });
+        }
+
+        function escapeHtmlNotas(s) {
+            return (s ?? '').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
     </script>
 </body>
 </html>

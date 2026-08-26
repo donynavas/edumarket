@@ -184,12 +184,15 @@ function crearActividadEnAsignacion(
     string $titulo, string $descripcion, string $tipo,
     string $fecha_programada, ?string $fecha_limite, ?int $duracion_minutos,
     float $nota_maxima, string $contenido, ?string $url_recurso, string $recursos_url,
-    string $estado, ?int $id_periodo_post, ?string $casilla_post, ?array $preguntas
+    string $estado, ?int $id_periodo_post, ?string $casilla_post, ?array $preguntas,
+    int $idProfesor = 0, ?int $idRubricaPlantilla = null
 ): int {
-    $vinculo = ['id_periodo' => null, 'bloque_notas' => null, 'numero_nota' => null];
-    if (in_array($tipo, ['tarea', 'examen'], true)) {
-        $vinculo = resolverVinculoCuadroNotas($db, $tid, $idAsignacion, $anno, $nivel, $id_periodo_post, $casilla_post, null);
-    }
+    // Antes solo se permitía vincular tarea/examen al Cuadro de Notas; el
+    // usuario pidió explícitamente que "cualquier actividad" pueda
+    // marcarse como nota evaluada, así que se resuelve el vínculo sin
+    // filtrar por tipo (resolverVinculoCuadroNotas() ya devuelve
+    // NULL/NULL/NULL si el profesor dejó ambos selects en "No vincular").
+    $vinculo = resolverVinculoCuadroNotas($db, $tid, $idAsignacion, $anno, $nivel, $id_periodo_post, $casilla_post, null);
 
     $id_examen = null;
     if ($tipo === 'examen') {
@@ -237,7 +240,90 @@ function crearActividadEnAsignacion(
         ':estado' => $estado
     ]);
 
-    return (int) $db->lastInsertId();
+    $idActividadNueva = (int) $db->lastInsertId();
+
+    // Rúbrica opcional (solo tiene sentido en tareas -- ver #bloque_rubrica
+    // en el modal, visible solo cuando tipo === 'tarea'). Cada sección
+    // destino recibe su PROPIA copia independiente, igual que cada sección
+    // ya recibe su propio examen+preguntas independientes cuando "Publicar
+    // a: Todo el grado" está activo -- así, calificar/editar la instancia
+    // de una sección nunca afecta a otra.
+    if ($tipo === 'tarea' && $idRubricaPlantilla) {
+        copiarRubricaATactividad($db, $tid, $idProfesor, $idRubricaPlantilla, $idActividadNueva);
+    }
+
+    return $idActividadNueva;
+}
+
+/**
+ * Copia una plantilla de rúbrica (id_actividad IS NULL, propiedad de
+ * $idProfesor) en una instancia propia de $idActividadNueva. La instancia
+ * es una copia completa e independiente -- niveles, criterios y celdas
+ * propios -- para que editar la plantilla más adelante nunca afecte
+ * retroactivamente una actividad ya creada/calificada (mismo espíritu que
+ * la copia tbl_banco_preguntas -> tbl_pregunta_examen ya existente en el
+ * proyecto). Devuelve el id de la nueva instancia (tbl_rubrica.id).
+ */
+function copiarRubricaATactividad(PDO $db, int $tid, int $idProfesor, int $idRubricaPlantilla, int $idActividadNueva): int {
+    $stmtTpl = $db->prepare("SELECT id, nombre, descripcion FROM tbl_rubrica
+        WHERE id = :id AND id_profesor = :prof AND id_institucion = :tid AND id_actividad IS NULL AND estado = 'activo'");
+    $stmtTpl->execute([':id' => $idRubricaPlantilla, ':prof' => $idProfesor, ':tid' => $tid]);
+    $tpl = $stmtTpl->fetch(PDO::FETCH_ASSOC);
+    if (!$tpl) {
+        throw new Exception('La rúbrica seleccionada no es válida.');
+    }
+
+    $stmtIns = $db->prepare("INSERT INTO tbl_rubrica (id_institucion, id_profesor, id_actividad, id_rubrica_origen, nombre, descripcion, estado)
+        VALUES (:tid, :prof, :act, :origen, :nombre, :descripcion, 'activo')");
+    $stmtIns->execute([
+        ':tid' => $tid, ':prof' => $idProfesor, ':act' => $idActividadNueva, ':origen' => $tpl['id'],
+        ':nombre' => $tpl['nombre'], ':descripcion' => $tpl['descripcion'],
+    ]);
+    $idInstancia = (int) $db->lastInsertId();
+
+    // Niveles (columnas de la matriz)
+    $mapNivel = [];
+    $stmtNiveles = $db->prepare("SELECT id, nombre, orden FROM tbl_rubrica_nivel WHERE id_rubrica = :id ORDER BY orden");
+    $stmtNiveles->execute([':id' => $tpl['id']]);
+    $stmtInsNivel = $db->prepare("INSERT INTO tbl_rubrica_nivel (id_rubrica, nombre, orden) VALUES (:rub, :nombre, :orden)");
+    foreach ($stmtNiveles->fetchAll(PDO::FETCH_ASSOC) as $niv) {
+        $stmtInsNivel->execute([':rub' => $idInstancia, ':nombre' => $niv['nombre'], ':orden' => $niv['orden']]);
+        $mapNivel[$niv['id']] = (int) $db->lastInsertId();
+    }
+
+    // Criterios (filas de la matriz)
+    $mapCriterio = [];
+    $stmtCriterios = $db->prepare("SELECT id, nombre, descripcion, orden FROM tbl_rubrica_criterio WHERE id_rubrica = :id ORDER BY orden");
+    $stmtCriterios->execute([':id' => $tpl['id']]);
+    $stmtInsCriterio = $db->prepare("INSERT INTO tbl_rubrica_criterio (id_rubrica, nombre, descripcion, orden) VALUES (:rub, :nombre, :descripcion, :orden)");
+    foreach ($stmtCriterios->fetchAll(PDO::FETCH_ASSOC) as $crit) {
+        $stmtInsCriterio->execute([':rub' => $idInstancia, ':nombre' => $crit['nombre'], ':descripcion' => $crit['descripcion'], ':orden' => $crit['orden']]);
+        $mapCriterio[$crit['id']] = (int) $db->lastInsertId();
+    }
+
+    // Celdas (descriptor + puntaje de cada intersección criterio×nivel).
+    // Se leen todas las celdas de la plantilla ORIGEN de una sola vez
+    // (join a criterio para acotar por id_rubrica) y se remapean con
+    // $mapCriterio/$mapNivel -- nunca se confía en un id ajeno.
+    $stmtCeldas = $db->prepare("SELECT ce.id_criterio, ce.id_nivel, ce.descripcion, ce.puntaje
+        FROM tbl_rubrica_celda ce
+        JOIN tbl_rubrica_criterio cr ON ce.id_criterio = cr.id
+        WHERE cr.id_rubrica = :id");
+    $stmtCeldas->execute([':id' => $tpl['id']]);
+    $stmtInsCelda = $db->prepare("INSERT INTO tbl_rubrica_celda (id_criterio, id_nivel, descripcion, puntaje) VALUES (:crit, :niv, :descripcion, :puntaje)");
+    foreach ($stmtCeldas->fetchAll(PDO::FETCH_ASSOC) as $celda) {
+        if (!isset($mapCriterio[$celda['id_criterio']], $mapNivel[$celda['id_nivel']])) {
+            continue; // fila huérfana defensiva; no debería ocurrir con datos consistentes
+        }
+        $stmtInsCelda->execute([
+            ':crit' => $mapCriterio[$celda['id_criterio']],
+            ':niv' => $mapNivel[$celda['id_nivel']],
+            ':descripcion' => $celda['descripcion'],
+            ':puntaje' => $celda['puntaje'],
+        ]);
+    }
+
+    return $idInstancia;
 }
 
 // ===== PROCESAR ACCIONES POST =====
@@ -269,6 +355,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
             $id_periodo_post = filter_input(INPUT_POST, 'id_periodo', FILTER_VALIDATE_INT) ?: null;
             $casilla_post = trim($_POST['casilla'] ?? '') ?: null;
+            $id_rubrica_plantilla = filter_input(INPUT_POST, 'id_rubrica_plantilla', FILTER_VALIDATE_INT) ?: null;
 
             // Verificar que la asignación pertenece al profesor. Se trae
             // también anno + nivel + id_grado/id_asignatura (vía
@@ -338,7 +425,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             $db, $tid, (int) $t['id'], (int) $t['anno'], $t['nivel'],
                             $titulo, $descripcion, $tipo, $fecha_programada, $fecha_limite, $duracion_minutos,
                             $nota_maxima, $contenido, $url_recurso, $recursos_url, $estado,
-                            $id_periodo_post, $casilla_post, $preguntas
+                            $id_periodo_post, $casilla_post, $preguntas,
+                            $id_profesor, $id_rubrica_plantilla
                         );
                         $db->commit();
                         $creadas++;
@@ -407,10 +495,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             if ($actividadActual && !empty($titulo)) {
                 $id_examen = $actividadActual['id_examen'] ?: null;
 
-                $vinculo = ['id_periodo' => null, 'bloque_notas' => null, 'numero_nota' => null];
-                if (in_array($tipo, ['tarea', 'examen'], true)) {
-                    $vinculo = resolverVinculoCuadroNotas($db, $tid, $id_asignacion, (int) $actividadActual['anno'], $actividadActual['nivel'], $id_periodo_post, $casilla_post, $id_actividad);
-                }
+                // Mismo criterio que en crearActividadEnAsignacion(): ya no se
+                // restringe a tarea/examen, cualquier tipo puede vincularse.
+                $vinculo = resolverVinculoCuadroNotas($db, $tid, $id_asignacion, (int) $actividadActual['anno'], $actividadActual['nivel'], $id_periodo_post, $casilla_post, $id_actividad);
 
                 if ($tipo === 'examen') {
                     $preguntas = json_decode($_POST['preguntas_json'] ?? '[]', true);
@@ -693,6 +780,14 @@ $tipos_actividad = [
     'enlace' => ['label' => '🔗 Enlace', 'icon' => 'fa-link', 'color' => 'secondary']
 ];
 
+// ===== RÚBRICAS DE LA BIBLIOTECA PERSONAL (para asociar al crear tarea) =====
+// Solo plantillas (id_actividad IS NULL) activas de este profesor -- ver
+// rubricas.php. Se copian a una instancia propia de la actividad en
+// copiarRubricaATactividad() (arriba) al guardar.
+$stmtRub = $db->prepare("SELECT id, nombre FROM tbl_rubrica WHERE id_profesor = :prof AND id_institucion = :tid AND id_actividad IS NULL AND estado = 'activo' ORDER BY nombre");
+$stmtRub->execute([':prof' => $id_profesor, ':tid' => $tid]);
+$rubricas_plantilla = $stmtRub->fetchAll(PDO::FETCH_ASSOC);
+
 // ===== EVENTOS PARA EL MODAL "CALENDARIO" =====
 // A diferencia de $actividades (arriba), que solo trae la asignación
 // actualmente filtrada, este barrido trae TODAS las asignaciones del
@@ -929,6 +1024,20 @@ require __DIR__ . '/partials/header.php';
                                 </select>
                                 <small class="text-muted">Crea una copia independiente de esta actividad (con su propio examen, si aplica) en cada sección.</small>
                             </div>
+                            <div class="col-12 d-none" id="bloque_rubrica">
+                                <label class="form-label">Rúbrica de evaluación</label>
+                                <select name="id_rubrica_plantilla" id="id_rubrica_plantilla" class="form-select">
+                                    <option value="">Sin rúbrica (calificar solo con nota numérica)</option>
+                                    <?php foreach ($rubricas_plantilla as $r): ?>
+                                    <option value="<?= $r['id'] ?>"><?= htmlspecialchars($r['nombre']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                                <small class="text-muted">
+                                    Se copia una versión propia de esta rúbrica a la actividad (o a cada sección, si "Publicar a: Todo el grado").
+                                    Editar la plantilla después no afecta esta copia.
+                                    <a href="rubricas.php" target="_blank">Administrar rúbricas <i class="fas fa-external-link-alt"></i></a>
+                                </small>
+                            </div>
                             <div class="col-md-8">
                                 <label class="form-label">Título *</label>
                                 <input type="text" name="titulo" id="titulo" class="form-control" required placeholder="Título de la actividad">
@@ -1003,14 +1112,15 @@ require __DIR__ . '/partials/header.php';
                                 </select>
                             </div>
 
-                            <!-- Vinculación al Cuadro de Notas (solo tarea/examen) -->
+                            <!-- Vinculación al Cuadro de Notas (cualquier tipo de actividad) -->
                             <div id="bloque_cuadro_notas" class="col-12 d-none">
                                 <hr>
-                                <label class="form-label mb-1"><i class="fas fa-clipboard-list"></i> Vincular al Cuadro de Notas</label>
+                                <label class="form-label mb-1"><i class="fas fa-clipboard-list"></i> ¿Es nota evaluada? Vincular al Cuadro de Notas</label>
                                 <small class="text-muted d-block mb-2">
-                                    Opcional. Si eliges un período y una casilla, la nota final de esta actividad se
-                                    copiará automáticamente a esa casilla del Cuadro de Notas (podrás seguir
-                                    ajustándola a mano ahí si hace falta).
+                                    Opcional para cualquier tipo de actividad. Si eliges un período y una casilla, la
+                                    nota final de esta actividad se copiará automáticamente a esa casilla del Cuadro
+                                    de Notas (podrás seguir ajustándola a mano ahí si hace falta). Si dejas ambos en
+                                    "No vincular", la actividad no cuenta como nota evaluada.
                                 </small>
                                 <?php if (empty($periodos_cuadro)): ?>
                                 <p class="text-muted small mb-0">No hay períodos configurados todavía para esta asignación.</p>
@@ -1140,15 +1250,21 @@ require __DIR__ . '/partials/header.php';
             const campoContenido = document.getElementById('campo_contenido');
             const bloqueExamen = document.getElementById('bloque_examen');
             const bloqueCuadroNotas = document.getElementById('bloque_cuadro_notas');
+            const bloqueRubrica = document.getElementById('bloque_rubrica');
             const labelUrl = document.getElementById('label_url');
             const helpUrl = document.getElementById('help_url');
 
             campoUrl.classList.add('d-none');
             campoContenido.classList.add('d-none');
             bloqueExamen.classList.add('d-none');
-            // Solo tarea y examen producen una nota que tenga sentido llevar
-            // al Cuadro de Notas (los demás tipos son material de consulta).
-            bloqueCuadroNotas.classList.toggle('d-none', !['tarea', 'examen'].includes(tipo));
+            // El profesor decide si CUALQUIER tipo de actividad es nota
+            // evaluada -- ya no se restringe a tarea/examen.
+            bloqueCuadroNotas.classList.remove('d-none');
+            // La rúbrica solo aplica a tareas, y solo al CREAR (una actividad
+            // ya existente no cambia de rúbrica desde este modal -- mismo
+            // criterio que "Publicar a", ver #bloque_publicar_a).
+            const esCrear = document.getElementById('accion').value === 'crear';
+            bloqueRubrica.classList.toggle('d-none', !(esCrear && tipo === 'tarea'));
 
             if (['youtube', 'video', 'enlace', 'podcast'].includes(tipo)) {
                 campoUrl.classList.remove('d-none');

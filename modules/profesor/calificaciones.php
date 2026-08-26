@@ -177,8 +177,176 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             } else {
                 throw new Exception("Actividad no válida");
             }
+
+        } elseif ($accion == 'calificar_rubrica') {
+            // Calificación con la matriz de rúbrica de la actividad (ver
+            // modules/profesor/rubricas.php y
+            // gestionar_actividades.php::copiarRubricaATactividad()). Sigue
+            // escribiendo su suma en la MISMA columna nota_obtenida que ya
+            // usa calificar_entrega -- es una captura más rica del mismo
+            // número, no un sistema paralelo, así que CuadroNotasHelper,
+            // vw_logro_estudiante, reportes, etc. siguen funcionando igual.
+            $id_matricula = filter_input(INPUT_POST, 'id_matricula', FILTER_VALIDATE_INT);
+            $id_actividad = filter_input(INPUT_POST, 'id_actividad', FILTER_VALIDATE_INT);
+            $rubrica_nivel_post = is_array($_POST['rubrica_nivel'] ?? null) ? $_POST['rubrica_nivel'] : [];
+            $rubrica_comentario_post = is_array($_POST['rubrica_comentario'] ?? null) ? $_POST['rubrica_comentario'] : [];
+
+            // Mismo chequeo de propiedad que calificar_entrega.
+            $check = $db->prepare("
+                SELECT a.id, a.nota_maxima
+                FROM tbl_actividad a
+                JOIN tbl_asignacion_docente ad ON a.id_asignacion_docente = ad.id
+                JOIN tbl_matricula m ON m.id_seccion = ad.id_seccion AND m.anno = ad.anno
+                WHERE a.id = :id_actividad AND ad.id_profesor = :id_profesor AND m.id = :id_matricula
+            ");
+            $check->execute([':id_actividad' => $id_actividad, ':id_profesor' => $id_profesor, ':id_matricula' => $id_matricula]);
+            $actividad = $check->fetch(PDO::FETCH_ASSOC);
+            if (!$actividad) {
+                throw new Exception("No tiene permiso para calificar a este estudiante en esta actividad");
+            }
+
+            $stmtRub = $db->prepare("SELECT id FROM tbl_rubrica WHERE id_actividad = :id");
+            $stmtRub->execute([':id' => $id_actividad]);
+            $id_rubrica = $stmtRub->fetchColumn();
+            if (!$id_rubrica) {
+                throw new Exception("Esta actividad no tiene una rúbrica asociada");
+            }
+            if (empty($rubrica_nivel_post)) {
+                throw new Exception("Debe calificar al menos un criterio de la rúbrica");
+            }
+
+            // Por cada (id_criterio, id_nivel) enviado, releer el puntaje
+            // REAL desde la celda -- nunca se confía en un puntaje que el
+            // cliente pudiera enviar -- acotado a ESTA rúbrica (cr.id_rubrica)
+            // para que no se cuele un id_criterio/id_nivel de una rúbrica ajena.
+            $stmtCelda = $db->prepare("SELECT ce.puntaje FROM tbl_rubrica_celda ce
+                JOIN tbl_rubrica_criterio cr ON ce.id_criterio = cr.id
+                WHERE ce.id_criterio = :crit AND ce.id_nivel = :niv AND cr.id_rubrica = :rub");
+
+            $detalles = [];
+            $totalPuntaje = 0.0;
+            foreach ($rubrica_nivel_post as $idCriterioPost => $idNivelPost) {
+                $idCriterioPost = (int) $idCriterioPost;
+                $idNivelPost = (int) $idNivelPost;
+                if (!$idCriterioPost || !$idNivelPost) {
+                    continue;
+                }
+                $stmtCelda->execute([':crit' => $idCriterioPost, ':niv' => $idNivelPost, ':rub' => $id_rubrica]);
+                $puntaje = $stmtCelda->fetchColumn();
+                if ($puntaje === false) {
+                    continue; // celda no pertenece a esta rúbrica: se ignora
+                }
+                $totalPuntaje += (float) $puntaje;
+                $detalles[] = [
+                    'id_criterio' => $idCriterioPost,
+                    'id_nivel' => $idNivelPost,
+                    'puntaje' => (float) $puntaje,
+                    'comentario' => trim($rubrica_comentario_post[$idCriterioPost] ?? ''),
+                ];
+            }
+            if (empty($detalles)) {
+                throw new Exception("Ninguno de los criterios enviados es válido para esta rúbrica");
+            }
+
+            $nota_maxima = $actividad['nota_maxima'] ?? 10;
+            $nota_obtenida = min($totalPuntaje, $nota_maxima);
+
+            // No se toca observacion_docente aquí -- es independiente de los
+            // comentarios por criterio (comentario_criterio, abajo); se deja
+            // intacto si ya existía, y en NULL si la fila se crea recién ahora.
+            $query = "INSERT INTO tbl_entrega_actividad
+                          (id_actividad, id_matricula, nota_obtenida, observacion_docente, estado_entrega, fecha_calificacion)
+                      VALUES (:id_actividad, :id_matricula, :nota, NULL, 'calificado', NOW())
+                      ON DUPLICATE KEY UPDATE
+                          nota_obtenida = VALUES(nota_obtenida),
+                          estado_entrega = VALUES(estado_entrega),
+                          fecha_calificacion = VALUES(fecha_calificacion)";
+            $stmt = $db->prepare($query);
+            $stmt->execute([':id_actividad' => $id_actividad, ':id_matricula' => $id_matricula, ':nota' => $nota_obtenida]);
+
+            // LAST_INSERT_ID() no es confiable tras ON DUPLICATE KEY UPDATE
+            // cuando la fila ya existía (puede devolver 0) -- se relee el id
+            // real explícitamente.
+            $stmtEntrega = $db->prepare("SELECT id FROM tbl_entrega_actividad WHERE id_actividad = :a AND id_matricula = :m");
+            $stmtEntrega->execute([':a' => $id_actividad, ':m' => $id_matricula]);
+            $id_entrega = (int) $stmtEntrega->fetchColumn();
+
+            // Reemplazo completo del detalle de rúbrica de esta entrega.
+            $db->prepare("DELETE FROM tbl_entrega_rubrica_detalle WHERE id_entrega_actividad = :id")->execute([':id' => $id_entrega]);
+            $stmtInsDet = $db->prepare("INSERT INTO tbl_entrega_rubrica_detalle (id_entrega_actividad, id_criterio, id_nivel, puntaje_otorgado, comentario_criterio)
+                                        VALUES (:entrega, :crit, :niv, :pts, :com)");
+            foreach ($detalles as $d) {
+                $stmtInsDet->execute([
+                    ':entrega' => $id_entrega, ':crit' => $d['id_criterio'], ':niv' => $d['id_nivel'],
+                    ':pts' => $d['puntaje'], ':com' => $d['comentario'] !== '' ? $d['comentario'] : null,
+                ]);
+            }
+
+            $valorSobreDiez = $nota_maxima > 0 ? ($nota_obtenida / $nota_maxima) * 10 : null;
+            CuadroNotasHelper::sincronizar($db, $id_actividad, $id_matricula, $valorSobreDiez);
+
+            $db->commit();
+            $mensaje = 'Calificación por rúbrica guardada exitosamente';
+            $tipo_mensaje = 'success';
+
+        } elseif ($accion == 'comentario_multiple') {
+            // Guarda SOLO comentarios para varios estudiantes a la vez, sin
+            // tocar nota_obtenida/estado_entrega -- cierra el vacío de
+            // calificar_multiple (arriba), que hoy descarta por completo
+            // cualquier fila con la celda de nota vacía (línea "continue" si
+            // $nota === false), así que hoy es imposible guardar solo un
+            // comentario sin nota desde la vía masiva.
+            $id_actividad = filter_input(INPUT_POST, 'id_actividad', FILTER_VALIDATE_INT);
+            $comentarios = is_array($_POST['comentarios'] ?? null) ? $_POST['comentarios'] : [];
+
+            $check = $db->prepare("
+                SELECT a.id, ad.id_seccion, ad.anno
+                FROM tbl_actividad a
+                JOIN tbl_asignacion_docente ad ON a.id_asignacion_docente = ad.id
+                WHERE a.id = :id_actividad AND ad.id_profesor = :id_profesor
+            ");
+            $check->execute([':id_actividad' => $id_actividad, ':id_profesor' => $id_profesor]);
+            $actividad = $check->fetch(PDO::FETCH_ASSOC);
+
+            if ($actividad) {
+                // Sólo matrículas que de verdad pertenezcan a la sección/año
+                // de esta actividad -- mismo chequeo que calificar_multiple.
+                $checkMatricula = $db->prepare("
+                    SELECT id FROM tbl_matricula WHERE id = :id_matricula AND id_seccion = :id_seccion AND anno = :anno
+                ");
+
+                $query = "INSERT INTO tbl_entrega_actividad (id_actividad, id_matricula, nota_obtenida, observacion_docente, estado_entrega, fecha_calificacion)
+                          VALUES (:id_actividad, :id_matricula, NULL, :retro, NULL, NULL)
+                          ON DUPLICATE KEY UPDATE observacion_docente = VALUES(observacion_docente)";
+                $stmt = $db->prepare($query);
+
+                $actualizadas = 0;
+                foreach ($comentarios as $id_matricula => $texto) {
+                    $id_matricula = (int) $id_matricula;
+                    $texto = trim($texto);
+                    if ($texto === '') {
+                        continue;
+                    }
+                    $checkMatricula->execute([
+                        ':id_matricula' => $id_matricula,
+                        ':id_seccion' => $actividad['id_seccion'],
+                        ':anno' => $actividad['anno'],
+                    ]);
+                    if (!$checkMatricula->fetch()) {
+                        continue; // matrícula ajena a esta sección/año: se ignora
+                    }
+                    $stmt->execute([':id_actividad' => $id_actividad, ':id_matricula' => $id_matricula, ':retro' => $texto]);
+                    $actualizadas++;
+                }
+
+                $db->commit();
+                $mensaje = "$actualizadas comentario(s) guardado(s)";
+                $tipo_mensaje = 'success';
+            } else {
+                throw new Exception("Actividad no válida");
+            }
         }
-        
+
     } catch (Exception $e) {
         $db->rollBack();
         error_log("Error en calificaciones.php: " . $e->getMessage());
@@ -270,6 +438,70 @@ foreach ($actividades as $act) {
 }
 $es_examen_autocalificado = $actividad_seleccionada && $actividad_seleccionada['tipo'] === 'examen' && !empty($actividad_seleccionada['id_examen']);
 $examen_tiene_ensayo = false;
+
+// ===== RÚBRICA DE LA ACTIVIDAD SELECCIONADA (solo tareas) =====
+// Ver modules/profesor/rubricas.php (biblioteca de plantillas) y
+// gestionar_actividades.php::copiarRubricaATactividad() (copia a la
+// actividad). $rubrica_estructura queda null si la actividad no tiene
+// rúbrica asociada -- el HTML/JS de abajo usa eso para decidir si muestra
+// el input numérico de siempre o el botón "Calificar con rúbrica".
+$id_rubrica_actividad = null;
+$rubrica_estructura = null;
+$rubrica_detalle_por_matricula = []; // [id_matricula][id_criterio] = ['id_nivel'=>, 'comentario'=>]
+if ($actividad_seleccionada && $actividad_seleccionada['tipo'] === 'tarea') {
+    $stmtRubAct = $db->prepare("SELECT id FROM tbl_rubrica WHERE id_actividad = :id");
+    $stmtRubAct->execute([':id' => $id_actividad_filtro]);
+    $id_rubrica_actividad = $stmtRubAct->fetchColumn() ?: null;
+
+    if ($id_rubrica_actividad) {
+        $stmtN = $db->prepare("SELECT id, nombre, orden FROM tbl_rubrica_nivel WHERE id_rubrica = :id ORDER BY orden");
+        $stmtN->execute([':id' => $id_rubrica_actividad]);
+        $niveles = $stmtN->fetchAll(PDO::FETCH_ASSOC);
+
+        $stmtC = $db->prepare("SELECT id, nombre, descripcion, orden FROM tbl_rubrica_criterio WHERE id_rubrica = :id ORDER BY orden");
+        $stmtC->execute([':id' => $id_rubrica_actividad]);
+        $criterios = $stmtC->fetchAll(PDO::FETCH_ASSOC);
+
+        $stmtCe = $db->prepare("SELECT ce.id_criterio, ce.id_nivel, ce.descripcion, ce.puntaje FROM tbl_rubrica_celda ce
+                                JOIN tbl_rubrica_criterio cr ON ce.id_criterio = cr.id
+                                WHERE cr.id_rubrica = :id");
+        $stmtCe->execute([':id' => $id_rubrica_actividad]);
+        $celdas = [];
+        foreach ($stmtCe->fetchAll(PDO::FETCH_ASSOC) as $ce) {
+            $celdas[$ce['id_criterio']][$ce['id_nivel']] = ['descripcion' => $ce['descripcion'], 'puntaje' => (float) $ce['puntaje']];
+        }
+
+        $rubrica_estructura = [
+            'niveles' => array_map(fn($n) => ['id' => (int) $n['id'], 'nombre' => $n['nombre']], $niveles),
+            'criterios' => array_map(function ($c) use ($niveles, $celdas) {
+                return [
+                    'id' => (int) $c['id'], 'nombre' => $c['nombre'], 'descripcion' => $c['descripcion'],
+                    'niveles' => array_map(function ($n) use ($c, $celdas) {
+                        $celda = $celdas[$c['id']][$n['id']] ?? ['descripcion' => null, 'puntaje' => 0.0];
+                        return ['id_nivel' => (int) $n['id'], 'descripcion' => $celda['descripcion'], 'puntaje' => (float) $celda['puntaje']];
+                    }, $niveles),
+                ];
+            }, $criterios),
+        ];
+
+        // Detalle ya calificado (para prellenar la matriz al reabrir el modal).
+        $stmtDet = $db->prepare("SELECT ea.id_matricula, erd.id_criterio, erd.id_nivel, erd.comentario_criterio
+                                 FROM tbl_entrega_rubrica_detalle erd
+                                 JOIN tbl_entrega_actividad ea ON erd.id_entrega_actividad = ea.id
+                                 WHERE ea.id_actividad = :id_actividad");
+        $stmtDet->execute([':id_actividad' => $id_actividad_filtro]);
+        foreach ($stmtDet->fetchAll(PDO::FETCH_ASSOC) as $d) {
+            $rubrica_detalle_por_matricula[$d['id_matricula']][$d['id_criterio']] = [
+                'id_nivel' => (int) $d['id_nivel'], 'comentario' => $d['comentario_criterio'],
+            ];
+        }
+    }
+}
+
+// ===== BANCO DE COMENTARIOS REUTILIZABLES (biblioteca personal) =====
+$stmtBancoCom = $db->prepare("SELECT id, texto, categoria FROM tbl_banco_comentario WHERE id_profesor = :prof AND id_institucion = :tid AND estado = 'activo' ORDER BY updated_at DESC");
+$stmtBancoCom->execute([':prof' => $id_profesor, ':tid' => $tid]);
+$comentarios_banco = $stmtBancoCom->fetchAll(PDO::FETCH_ASSOC);
 
 // ===== OBTENER ENTREGAS PARA CALIFICAR =====
 $entregas = [];
@@ -696,29 +928,57 @@ require __DIR__ . '/partials/header.php';
             <input type="hidden" name="id_actividad" value="<?= $id_actividad_filtro ?>">
             
             <div class="card-custom">
-                <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
-                    <h5 class="mb-0">
-                        <i class="fas fa-list"></i> Entregas de Estudiantes
-                        <span class="badge bg-primary ms-2"><?= count($entregas) ?></span>
-                    </h5>
-                    <div class="d-flex gap-2">
-                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="llenarNotasAutomaticas()">
-                            <i class="fas fa-magic"></i> Autollenar
+                <div class="card-header bg-white py-3">
+                    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <h5 class="mb-0">
+                            <i class="fas fa-list"></i> Entregas de Estudiantes
+                            <span class="badge bg-primary ms-2"><?= count($entregas) ?></span>
+                        </h5>
+                        <div class="d-flex gap-2 flex-wrap">
+                            <?php if (!$id_rubrica_actividad): ?>
+                            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="llenarNotasAutomaticas()">
+                                <i class="fas fa-magic"></i> Autollenar
+                            </button>
+                            <?php endif; ?>
+                            <a href="api/exportar_calificaciones.php?id_actividad=<?= (int) $id_actividad_filtro ?>" class="btn btn-outline-success btn-sm">
+                                <i class="fas fa-file-excel"></i> Exportar a Excel
+                            </a>
+                            <button type="submit" class="btn btn-primary btn-sm">
+                                <i class="fas fa-save"></i> Guardar Todas
+                            </button>
+                        </div>
+                    </div>
+                    <div class="d-flex gap-2 align-items-center flex-wrap mt-2 pt-2 border-top">
+                        <small class="text-muted"><i class="fas fa-comment-dots"></i> Banco de comentarios:</small>
+                        <?php if ($comentarios_banco): ?>
+                        <select id="selectorBancoMasivo" class="form-select form-select-sm" style="max-width: 320px;">
+                            <option value="">-- Elegir comentario --</option>
+                            <?php foreach ($comentarios_banco as $c): ?>
+                            <option value="<?= htmlspecialchars($c['texto']) ?>"><?= htmlspecialchars(mb_strimwidth($c['texto'], 0, 60, '…')) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="aplicarComentarioASeleccionados()">
+                            <i class="fas fa-check-double"></i> Aplicar a seleccionados
                         </button>
-                        <button type="submit" class="btn btn-primary btn-sm">
-                            <i class="fas fa-save"></i> Guardar Todas
+                        <button type="button" class="btn btn-outline-primary btn-sm" onclick="guardarComentariosSeleccionados()">
+                            <i class="fas fa-save"></i> Guardar solo comentarios (seleccionados)
+                        </button>
+                        <?php endif; ?>
+                        <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal" data-bs-target="#modalBancoComentarios">
+                            <i class="fas fa-cog"></i> Administrar banco
                         </button>
                     </div>
                 </div>
-                
+
                 <div class="table-responsive">
                     <table class="table table-hover mb-0 align-middle">
                         <thead class="table-light">
                             <tr>
+                                <th><input type="checkbox" class="form-check-input" id="chkTodos" onchange="document.querySelectorAll('.chk-estudiante').forEach(c => c.checked = this.checked)"></th>
                                 <th>Estudiante</th>
                                 <th>Entrega</th>
                                 <th>Estado</th>
-                                <th>Nota (<?= $entregas[0]['nota_maxima'] ?>)</th>
+                                <th><?= $id_rubrica_actividad ? 'Nota (rúbrica)' : 'Nota (' . $entregas[0]['nota_maxima'] . ')' ?></th>
                                 <th>Retroalimentación</th>
                                 <th>Acciones</th>
                             </tr>
@@ -730,8 +990,10 @@ require __DIR__ . '/partials/header.php';
                                 $estado = $estados_entrega[$entrega['estado_entrega']] ?? ['label' => $entrega['estado_entrega'], 'class' => 'bg-secondary'];
                                 $nota_clase = $entrega['nota_obtenida'] !== null ?
                                     ($entrega['nota_obtenida'] >= ($entrega['nota_maxima']*$umbral_aprobacion_pct) ? 'aprobado' : 'reprobado') : '';
+                                $notaActual = $entrega['nota_obtenida'];
                             ?>
                             <tr>
+                                <td><input type="checkbox" class="form-check-input chk-estudiante" value="<?= $entrega['id_matricula'] ?>"></td>
                                 <td>
                                     <div class="d-flex align-items-center gap-2">
                                         <div class="student-avatar"><?= $iniciales ?></div>
@@ -758,12 +1020,20 @@ require __DIR__ . '/partials/header.php';
                                         <?= $estado['label'] ?>
                                     </span>
                                 </td>
+                                <?php if ($id_rubrica_actividad): ?>
+                                <td>
+                                    <div class="mb-1 fw-bold <?= $nota_clase ?>"><?= $notaActual !== null ? number_format($notaActual, 2) . '/' . $entrega['nota_maxima'] : 'Sin calificar' ?></div>
+                                    <button type="button" class="btn btn-outline-primary btn-sm" onclick='abrirModalRubrica(<?= (int) $entrega['id_matricula'] ?>, <?= json_encode($nombre_completo, JSON_HEX_APOS | JSON_HEX_QUOT) ?>)'>
+                                        <i class="fas fa-th"></i> Calificar con rúbrica
+                                    </button>
+                                </td>
+                                <?php else: ?>
                                 <td>
                                     <div class="input-group input-group-sm">
                                         <input type="number"
                                                name="calificaciones[<?= $entrega['id_matricula'] ?>][nota]"
                                                class="form-control nota-input <?= $nota_clase ?>"
-                                               value="<?= $entrega['nota_obtenida'] ?? '' ?>"
+                                               value="<?= $notaActual ?? '' ?>"
                                                min="0"
                                                max="<?= $entrega['nota_maxima'] ?>"
                                                step="0.1"
@@ -772,6 +1042,7 @@ require __DIR__ . '/partials/header.php';
                                         <span class="input-group-text">/<?= $entrega['nota_maxima'] ?></span>
                                     </div>
                                 </td>
+                                <?php endif; ?>
                                 <td>
                                     <textarea name="calificaciones[<?= $entrega['id_matricula'] ?>][retroalimentacion]"
                                               class="form-control form-control-sm retro-textarea"
@@ -779,12 +1050,11 @@ require __DIR__ . '/partials/header.php';
                                 </td>
                                 <td>
                                     <div class="btn-group btn-group-sm">
+                                        <?php if (!$id_rubrica_actividad): ?>
                                         <button type="button" class="btn btn-outline-primary" onclick="calificarIndividual(<?= $entrega['id_matricula'] ?>)" title="Guardar solo esta">
                                             <i class="fas fa-save"></i>
                                         </button>
-                                        <button type="button" class="btn btn-outline-info" title="Ver entrega completa">
-                                            <i class="fas fa-eye"></i>
-                                        </button>
+                                        <?php endif; ?>
                                     </div>
                                 </td>
                             </tr>
@@ -867,6 +1137,70 @@ require __DIR__ . '/partials/header.php';
         </div>
     </div>
 
+    <!-- Modal Calificar con Rúbrica -->
+    <div class="modal fade" id="modalCalificarRubrica" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content">
+                <div class="modal-header bg-primary text-white">
+                    <h5 class="modal-title"><i class="fas fa-th"></i> Calificar con rúbrica: <span id="rub_estudiante"></span></h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST" id="formCalificarRubrica">
+                    <div class="modal-body">
+                        <input type="hidden" name="accion" value="calificar_rubrica">
+                        <input type="hidden" name="id_matricula" id="rub_id_matricula">
+                        <input type="hidden" name="id_actividad" value="<?= (int) $id_actividad_filtro ?>">
+
+                        <div id="rubrica_matriz_container"></div>
+
+                        <div class="alert alert-light border mt-3 d-flex justify-content-between align-items-center mb-0">
+                            <strong>Total</strong>
+                            <span><strong id="rub_total_puntos">0</strong> / <span id="rub_nota_maxima_actividad">10</span> pts</span>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                        <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Guardar Calificación</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Administrar Banco de Comentarios -->
+    <div class="modal fade" id="modalBancoComentarios" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title"><i class="fas fa-comment-dots"></i> Banco de comentarios</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="listaBancoComentarios" class="mb-3">
+                        <?php if (empty($comentarios_banco)): ?>
+                        <p class="text-muted small" id="bancoComentariosVacio">Todavía no tienes comentarios guardados.</p>
+                        <?php else: ?>
+                        <?php foreach ($comentarios_banco as $c): ?>
+                        <div class="d-flex justify-content-between align-items-start border rounded p-2 mb-2" data-id-comentario="<?= $c['id'] ?>">
+                            <div class="small"><?= htmlspecialchars($c['texto']) ?><?php if ($c['categoria']): ?><br><span class="badge bg-light text-dark border"><?= htmlspecialchars($c['categoria']) ?></span><?php endif; ?></div>
+                            <button type="button" class="btn btn-sm btn-outline-danger ms-2" onclick="eliminarComentarioBanco(<?= $c['id'] ?>, this)"><i class="fas fa-trash"></i></button>
+                        </div>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
+                    </div>
+                    <hr>
+                    <label class="form-label small">Nuevo comentario</label>
+                    <textarea id="nuevoComentarioTexto" class="form-control form-control-sm mb-2" rows="2" placeholder="Ej: Buen trabajo, pero revisa la ortografía."></textarea>
+                    <input type="text" id="nuevoComentarioCategoria" class="form-control form-control-sm mb-2" placeholder="Categoría (opcional)">
+                    <button type="button" class="btn btn-primary btn-sm w-100" onclick="agregarComentarioBanco()"><i class="fas fa-plus"></i> Agregar al banco</button>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Scripts -->
     <?php require __DIR__ . '/partials/scripts.php'; ?>
 
@@ -875,6 +1209,14 @@ require __DIR__ . '/partials/header.php';
     // (nota_minima_aprobacion/10). Ver PHP arriba: reemplaza el 60% fijo
     // que se usaba antes sin importar el grado.
     const UMBRAL_APROBACION_PCT = <?= json_encode($umbral_aprobacion_pct) ?>;
+
+    // Estructura de la rúbrica de la actividad seleccionada (null si no
+    // tiene) y el detalle ya calificado por estudiante, para prellenar el
+    // modal de calificación al reabrirlo. Ver PHP arriba
+    // ($rubrica_estructura / $rubrica_detalle_por_matricula).
+    const RUBRICA_ESTRUCTURA = <?= json_encode($rubrica_estructura, JSON_UNESCAPED_UNICODE) ?>;
+    const RUBRICA_DETALLE = <?= json_encode($rubrica_detalle_por_matricula, JSON_UNESCAPED_UNICODE) ?>;
+    const NOTA_MAXIMA_ACTIVIDAD = <?= json_encode((float) ($actividad_seleccionada['nota_maxima'] ?? 10)) ?>;
 
     $(document).ready(function() {
         // Sidebar responsive
@@ -958,27 +1300,151 @@ require __DIR__ . '/partials/header.php';
         setTimeout(() => $('.btn-primary').html(originalText), 2000);
     }
     
-    // Exportar calificaciones a CSV
-    function exportarCalificaciones() {
-        let csv = 'Estudiante,NIE,Nota,Estado,Retroalimentación\n';
-        
-        $('tbody tr').each(function() {
-            const nombre = $(this).find('strong').text();
-            const nie = $(this).find('.text-muted').first().text();
-            const nota = $(this).find('input[name*="[nota]"]').val() || '-';
-            const estado = $(this).find('.badge-estado').text();
-            const retro = $(this).find('textarea').val().replace(/\n/g, ' ');
-            
-            csv += `"${nombre}","${nie}","${nota}","${estado}","${retro}"\n`;
-        });
-        
-        const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = `calificaciones_${new Date().toISOString().slice(0,10)}.csv`;
-        link.click();
+    // ===== Calificación con rúbrica =====
+    // La matriz se construye en JS a partir de RUBRICA_ESTRUCTURA (misma
+    // rúbrica para todos los estudiantes de esta actividad) y se prellena
+    // por estudiante con RUBRICA_DETALLE[idMatricula]. Radios con
+    // name="rubrica_nivel[id_criterio]" y textareas con
+    // name="rubrica_comentario[id_criterio]" postean directamente como
+    // arreglos PHP -- no hace falta serializar nada aparte al enviar.
+    function escapeHtml(s) {
+        return (s ?? '').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
-    
+
+    function abrirModalRubrica(idMatricula, nombreEstudiante) {
+        if (!RUBRICA_ESTRUCTURA) return;
+        document.getElementById('rub_id_matricula').value = idMatricula;
+        document.getElementById('rub_estudiante').textContent = nombreEstudiante;
+        document.getElementById('rub_nota_maxima_actividad').textContent = NOTA_MAXIMA_ACTIVIDAD;
+
+        const detalle = RUBRICA_DETALLE[idMatricula] || {};
+        const cont = document.getElementById('rubrica_matriz_container');
+        cont.innerHTML = '';
+
+        const table = document.createElement('table');
+        table.className = 'table table-bordered table-sm align-middle';
+
+        let headHtml = '<thead class="table-light"><tr><th style="min-width:220px">Criterio</th>';
+        RUBRICA_ESTRUCTURA.niveles.forEach(n => { headHtml += `<th class="text-center">${escapeHtml(n.nombre)}</th>`; });
+        headHtml += '</tr></thead>';
+        table.innerHTML = headHtml;
+
+        const tbody = document.createElement('tbody');
+        RUBRICA_ESTRUCTURA.criterios.forEach(crit => {
+            const detCrit = detalle[crit.id] || {};
+            const tr = document.createElement('tr');
+            let rowHtml = `<td><strong>${escapeHtml(crit.nombre)}</strong>`;
+            if (crit.descripcion) rowHtml += `<br><small class="text-muted">${escapeHtml(crit.descripcion)}</small>`;
+            rowHtml += `<textarea class="form-control form-control-sm mt-2" name="rubrica_comentario[${crit.id}]" rows="2" placeholder="Comentario (opcional)">${escapeHtml(detCrit.comentario)}</textarea></td>`;
+
+            crit.niveles.forEach(niv => {
+                const checked = (detCrit.id_nivel === niv.id_nivel) ? 'checked' : '';
+                rowHtml += `<td class="text-center celda-rub-radio" data-puntaje="${niv.puntaje}">
+                    <div class="small mb-1">${niv.descripcion ? escapeHtml(niv.descripcion) : '<span class="text-muted">—</span>'}</div>
+                    <input type="radio" class="form-check-input campo-rub-radio" name="rubrica_nivel[${crit.id}]" value="${niv.id_nivel}" ${checked} onchange="recalcularTotalRubrica()">
+                    <div class="small text-muted">${niv.puntaje} pts</div>
+                </td>`;
+            });
+            tr.innerHTML = rowHtml;
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        cont.appendChild(table);
+
+        recalcularTotalRubrica();
+        new bootstrap.Modal(document.getElementById('modalCalificarRubrica')).show();
+    }
+
+    function recalcularTotalRubrica() {
+        let total = 0;
+        document.querySelectorAll('#rubrica_matriz_container .campo-rub-radio:checked').forEach(r => {
+            total += parseFloat(r.closest('.celda-rub-radio')?.dataset.puntaje || 0);
+        });
+        document.getElementById('rub_total_puntos').textContent = total.toFixed(2);
+    }
+
+    // ===== Banco de comentarios: aplicar a varios estudiantes a la vez =====
+    function aplicarComentarioASeleccionados() {
+        const texto = document.getElementById('selectorBancoMasivo').value;
+        if (!texto) { alert('Elige un comentario del banco primero'); return; }
+        const seleccionados = document.querySelectorAll('.chk-estudiante:checked');
+        if (seleccionados.length === 0) { alert('Marca al menos un estudiante'); return; }
+        seleccionados.forEach(chk => {
+            const fila = chk.closest('tr');
+            fila.querySelector('textarea[name*="[retroalimentacion]"]').value = texto;
+        });
+    }
+
+    // Guarda SOLO los comentarios de las filas marcadas, sin tocar la nota
+    // -- vía accion=comentario_multiple (independiente del formulario
+    // principal de "Guardar Todas", que hoy descarta cualquier fila sin
+    // nota). Se arma un formulario nuevo dinámicamente y se envía (mismo
+    // patrón que eliminarActividad() en gestionar_actividades.php).
+    function guardarComentariosSeleccionados() {
+        const seleccionados = document.querySelectorAll('.chk-estudiante:checked');
+        if (seleccionados.length === 0) { alert('Marca al menos un estudiante'); return; }
+
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.style.display = 'none';
+        form.innerHTML = `<input type="hidden" name="accion" value="comentario_multiple">
+                           <input type="hidden" name="id_actividad" value="<?= (int) $id_actividad_filtro ?>">`;
+        seleccionados.forEach(chk => {
+            const idMatricula = chk.value;
+            const texto = chk.closest('tr').querySelector('textarea[name*="[retroalimentacion]"]').value;
+            const input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = `comentarios[${idMatricula}]`;
+            input.value = texto;
+            form.appendChild(input);
+        });
+        document.body.appendChild(form);
+        form.submit();
+    }
+
+    // ===== Administrar banco de comentarios (modal) =====
+    // location.reload() tras guardar/eliminar (en vez de manipular el DOM a
+    // mano) -- mismo patrón que banco_preguntas.php -- así el <select> del
+    // toolbar y esta lista siempre quedan sincronizados sin duplicar lógica
+    // de renderizado en JS.
+    function agregarComentarioBanco() {
+        const texto = document.getElementById('nuevoComentarioTexto').value.trim();
+        if (!texto) { alert('Escribe el texto del comentario'); return; }
+        const formData = new FormData();
+        formData.append('accion', 'guardar');
+        formData.append('texto', texto);
+        formData.append('categoria', document.getElementById('nuevoComentarioCategoria').value.trim());
+
+        fetch('api/guardar_comentario_banco.php', { method: 'POST', body: formData })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            })
+            .catch(() => alert('Error de conexión al guardar el comentario'));
+    }
+
+    function eliminarComentarioBanco(idComentario, btn) {
+        if (!confirm('¿Eliminar este comentario del banco?')) return;
+        const formData = new FormData();
+        formData.append('accion', 'eliminar');
+        formData.append('id_comentario', idComentario);
+
+        fetch('api/guardar_comentario_banco.php', { method: 'POST', body: formData })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            })
+            .catch(() => alert('Error de conexión al eliminar el comentario'));
+    }
+
     // Confirmar antes de enviar formulario masivo
     $('#formCalificaciones').on('submit', function(e) {
         const notasLlenas = $('input[name*="[nota]"]').filter(function() {

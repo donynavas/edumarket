@@ -80,8 +80,10 @@ $NAV_LINKS = [
     'mensajes'     => ['href' => 'mensajes.php',               'icon' => 'fa-envelope',       'label' => 'Mensajes', 'badge' => $unreadMensajes ?: null],
     'examen'       => ['href' => 'asignar_examen.php',        'icon' => 'fa-file-alt',       'label' => 'Asignar Examen'],
     'banco'        => ['href' => 'banco_preguntas.php',       'icon' => 'fa-layer-group',    'label' => 'Banco de Preguntas'],
+    'rubricas'     => ['href' => 'rubricas.php',               'icon' => 'fa-th',             'label' => 'Rúbricas'],
     'tablon'       => ['href' => 'tablon.php',                'icon' => 'fa-th-large',       'label' => 'Tablón'],
     'asistencia'   => ['href' => 'asistencia.php',            'icon' => 'fa-clipboard-check','label' => 'Asistencia'],
+    'demeritos'    => ['href' => 'demeritos.php',              'icon' => 'fa-exclamation-triangle', 'label' => 'Deméritos'],
     'reportes'     => ['href' => 'reportes.php',               'icon' => 'fa-chart-bar',      'label' => 'Reportes'],
 ];
 ?>
