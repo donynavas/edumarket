@@ -21,6 +21,7 @@ require_once __DIR__ . '/../../config/TenantGuard.php';
 require_once __DIR__ . '/../../config/PeriodoHelper.php';
 require_once __DIR__ . '/../../config/CuadroNotasHelper.php';
 require_once __DIR__ . '/../../config/ActividadHelper.php';
+require_once __DIR__ . '/../../config/HtmlSanitizer.php';
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
     header("Location: " . BASE_URL . "/login.php");
@@ -108,9 +109,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
             $numero_clase = trim($_POST['numero_clase'] ?? '') ?: null;
             $fecha_clase = $_POST['fecha_clase'] ?: date('Y-m-d');
-            $objetivo = trim($_POST['objetivo'] ?? '');
-            $desarrollo = $_POST['desarrollo'] ?? '';
-            $cierre = trim($_POST['cierre'] ?? '');
+            // Objetivo/Desarrollo/Cierre vienen del editor de texto enriquecido
+            // (TinyMCE, ver el <script> más abajo) -- el HTML que llega por POST
+            // nunca es de confianza, se limpia con la misma lista blanca que ya
+            // usa el Manual de Convivencia antes de guardarlo.
+            $objetivo = HtmlSanitizer::limpiar(trim($_POST['objetivo'] ?? ''));
+            $desarrollo = HtmlSanitizer::limpiar($_POST['desarrollo'] ?? '');
+            $cierre = HtmlSanitizer::limpiar(trim($_POST['cierre'] ?? ''));
 
             $idClasePost = (int) ($_POST['id_clase'] ?? 0);
             if ($idClasePost > 0) {
@@ -424,17 +429,17 @@ require __DIR__ . '/partials/header.php';
 
                         <div class="mb-3">
                             <label class="form-label fw-bold">Objetivo de la Clase</label>
-                            <textarea name="objetivo" class="form-control" rows="2" placeholder="¿Qué aprenderán los estudiantes hoy?"><?= htmlspecialchars($clase['objetivo'] ?? '') ?></textarea>
+                            <textarea name="objetivo" id="rte-objetivo" class="form-control rte-editor" rows="2" placeholder="¿Qué aprenderán los estudiantes hoy?"><?= htmlspecialchars($clase['objetivo'] ?? '') ?></textarea>
                         </div>
 
                         <div class="mb-3">
                             <label class="form-label fw-bold">Desarrollo de la Clase</label>
-                            <textarea name="desarrollo" class="form-control" rows="6" placeholder="Actividades, explicación, ejercicios..."><?= htmlspecialchars($clase['desarrollo'] ?? '') ?></textarea>
+                            <textarea name="desarrollo" id="rte-desarrollo" class="form-control rte-editor" rows="6" placeholder="Actividades, explicación, ejercicios..."><?= htmlspecialchars($clase['desarrollo'] ?? '') ?></textarea>
                         </div>
 
                         <div class="mb-3">
                             <label class="form-label fw-bold">Cierre</label>
-                            <textarea name="cierre" class="form-control" rows="2" placeholder="Conclusión, resumen, próxima clase..."><?= htmlspecialchars($clase['cierre'] ?? '') ?></textarea>
+                            <textarea name="cierre" id="rte-cierre" class="form-control rte-editor" rows="2" placeholder="Conclusión, resumen, próxima clase..."><?= htmlspecialchars($clase['cierre'] ?? '') ?></textarea>
                         </div>
 
                         <button type="submit" class="btn btn-primary no-print"><i class="fas fa-save"></i> <?= $clase ? 'Actualizar Clase' : 'Guardar Clase' ?></button>
@@ -657,6 +662,43 @@ require __DIR__ . '/partials/header.php';
     <?php endif; ?>
 
     <?php require __DIR__ . '/partials/scripts.php'; ?>
+    <!-- Editor de texto enriquecido para Objetivo/Desarrollo/Cierre --
+         mismo patrón (autohospedado vía jsdelivr, sin API key) y misma
+         barra de herramientas que modules/admin/manual_convivencia.php.
+         A diferencia de esa pantalla, aquí los 3 campos siempre están
+         visibles (no viven dentro de pestañas ocultas de Bootstrap), así
+         que se inicializan directo al cargar la página -- no hace falta
+         el truco de init-por-pestaña. -->
+    <script src="https://cdn.jsdelivr.net/npm/tinymce@6/tinymce.min.js" referrerpolicy="origin"></script>
+    <script>
+        if (typeof tinymce !== 'undefined' && document.querySelector('textarea.rte-editor')) {
+            tinymce.init({
+                selector: 'textarea.rte-editor',
+                height: 220,
+                menubar: false,
+                statusbar: false,
+                branding: false,
+                promotion: false,
+                plugins: 'table',
+                toolbar: 'undo redo | bold italic underline | forecolor backcolor | fontfamily fontsize | alignleft aligncenter alignright alignjustify | table | removeformat',
+                font_family_formats: 'Arial=arial,helvetica,sans-serif; Georgia=georgia,palatino,serif; Times New Roman=times new roman,times,serif; Verdana=verdana,geneva,sans-serif; Courier New=courier new,courier,monospace',
+                font_size_formats: '8pt 10pt 12pt 14pt 16pt 18pt 24pt 36pt',
+                content_style: "body { font-family: 'Segoe UI', sans-serif; font-size: 14px; }",
+                table_default_attributes: { border: '1' },
+                table_default_styles: { width: '100%' },
+            });
+        }
+        // TinyMCE reemplaza visualmente el <textarea> pero solo escribe de
+        // vuelta su contenido en él al detectar el submit del <form> que lo
+        // contiene -- sin esto, el POST enviaría el textarea vacío.
+        document.querySelectorAll('form').forEach(function (form) {
+            form.addEventListener('submit', function () {
+                if (typeof tinymce !== 'undefined') {
+                    tinymce.triggerSave();
+                }
+            });
+        });
+    </script>
     <script>
         function eliminarClase(id) {
             if (!confirm('¿Eliminar esta clase? Esto no borra las actividades ya creadas (tarea/examen/actividad), solo el registro de la clase.')) return;

@@ -88,7 +88,12 @@ $iconosRecurso = ['imagen' => 'fa-image', 'sitio_web' => 'fa-globe', 'articulo' 
     .paso.activo { display: block; animation: aparecer 0.25s ease; }
     @keyframes aparecer { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
     .paso h2 { font-size: 2.2rem; color: #5dade2; margin-bottom: 24px; }
-    .paso .contenido { font-size: 1.6rem; line-height: 1.6; white-space: pre-wrap; }
+    /* Objetivo/Desarrollo/Cierre ahora vienen como HTML ya sanitizado del
+       editor de texto enriquecido (ver impartir_clase.php) -- sin
+       white-space:pre-wrap, que era para cuando estos campos eran texto
+       plano; las etiquetas <p>/<br> del editor ya manejan el espaciado. */
+    .paso .contenido { font-size: 1.6rem; line-height: 1.6; }
+    .paso .contenido table { color: #eef2f6; border-color: #34495e; }
     .recurso-btn { display: inline-flex; align-items: center; gap: 10px; background: #1b232d; border: 1px solid #34495e; border-radius: 10px; padding: 16px 22px; margin: 8px; font-size: 1.2rem; color: #eef2f6; text-decoration: none; }
     .recurso-btn:hover { background: #223142; color: #eef2f6; }
     .recurso-btn img { max-height: 60vh; max-width: 100%; border-radius: 8px; display: block; margin: 12px auto; }
@@ -118,11 +123,11 @@ $iconosRecurso = ['imagen' => 'fa-image', 'sitio_web' => 'fa-globe', 'articulo' 
     <div class="escenario">
         <div class="paso activo" data-paso="0">
             <h2><i class="fas fa-bullseye"></i> Objetivo de la Clase</h2>
-            <div class="contenido"><?= htmlspecialchars($clase['objetivo'] ?: 'Sin objetivo registrado.') ?></div>
+            <div class="contenido"><?= $clase['objetivo'] ? $clase['objetivo'] : 'Sin objetivo registrado.' ?></div>
         </div>
         <div class="paso" data-paso="1">
             <h2><i class="fas fa-chalkboard"></i> Desarrollo de la Clase</h2>
-            <div class="contenido"><?= htmlspecialchars($clase['desarrollo'] ?: 'Sin desarrollo registrado.') ?></div>
+            <div class="contenido"><?= $clase['desarrollo'] ? $clase['desarrollo'] : 'Sin desarrollo registrado.' ?></div>
         </div>
         <div class="paso" data-paso="2">
             <h2><i class="fas fa-book-open"></i> Recursos</h2>
@@ -149,7 +154,7 @@ $iconosRecurso = ['imagen' => 'fa-image', 'sitio_web' => 'fa-globe', 'articulo' 
         </div>
         <div class="paso" data-paso="3">
             <h2><i class="fas fa-flag-checkered"></i> Cierre</h2>
-            <div class="contenido"><?= htmlspecialchars($clase['cierre'] ?: 'Sin cierre registrado.') ?></div>
+            <div class="contenido"><?= $clase['cierre'] ? $clase['cierre'] : 'Sin cierre registrado.' ?></div>
         </div>
     </div>
 

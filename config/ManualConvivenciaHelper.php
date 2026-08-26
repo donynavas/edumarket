@@ -8,6 +8,7 @@
  * manual de "inicializar".
  */
 require_once __DIR__ . '/CatalogoConvivencia.php';
+require_once __DIR__ . '/HtmlSanitizer.php';
 
 class ManualConvivenciaHelper
 {
@@ -137,58 +138,14 @@ class ManualConvivenciaHelper
     }
 
     /**
-     * Limpia el HTML que produce la barra de herramientas del editor de
-     * texto enriquecido (negrita, cursiva, subrayado, alineación,
-     * tamaño/tipo de fuente y color vía estilo en línea, tablas) antes de
-     * guardarlo -- el editor corre en el navegador del director, así que
-     * el servidor nunca debe confiar en el HTML que llega por POST tal
-     * cual. Se usa una lista blanca de etiquetas (vía strip_tags) y luego
-     * se recorre el DOM para quitar cualquier atributo peligroso
-     * (onclick, onerror, etc.) de las etiquetas que sí se permiten.
+     * Alias delgado hacia HtmlSanitizer::limpiar() (ver config/HtmlSanitizer.php
+     * -- misma implementación, extraída de aquí para poder reutilizarse en
+     * otros formularios con editor de texto enriquecido, como
+     * modules/profesor/impartir_clase.php). Se conserva este método para
+     * no romper las llamadas existentes en modules/admin/manual_convivencia.php.
      */
     public static function sanitizarHtml(?string $html): ?string
     {
-        if ($html === null || trim($html) === '') {
-            return $html;
-        }
-
-        $etiquetasPermitidas = '<p><br><strong><b><em><i><u><span><div><ul><ol><li><table><thead><tbody><tfoot><tr><td><th>';
-        $limpio = strip_tags($html, $etiquetasPermitidas);
-
-        $doc = new DOMDocument();
-        libxml_use_internal_errors(true);
-        $doc->loadHTML('<?xml encoding="utf-8" ?><div>' . $limpio . '</div>', LIBXML_NOERROR | LIBXML_NOWARNING);
-        libxml_clear_errors();
-
-        $atributosPermitidos = ['style', 'colspan', 'rowspan'];
-        $xpath = new DOMXPath($doc);
-        foreach ($xpath->query('//*') as $nodo) {
-            if (!($nodo instanceof DOMElement)) {
-                continue;
-            }
-            $aQuitar = [];
-            foreach (iterator_to_array($nodo->attributes) as $attr) {
-                $nombre = strtolower($attr->name);
-                $valor = $attr->value;
-                $peligroso = str_starts_with($nombre, 'on')
-                    || !in_array($nombre, $atributosPermitidos, true)
-                    || ($nombre === 'style' && (stripos($valor, 'expression(') !== false || stripos($valor, 'javascript:') !== false));
-                if ($peligroso) {
-                    $aQuitar[] = $attr->name;
-                }
-            }
-            foreach ($aQuitar as $nombreAttr) {
-                $nodo->removeAttribute($nombreAttr);
-            }
-        }
-
-        $contenedor = $doc->getElementsByTagName('div')->item(0);
-        $resultado = '';
-        if ($contenedor) {
-            foreach ($contenedor->childNodes as $child) {
-                $resultado .= $doc->saveHTML($child);
-            }
-        }
-        return $resultado;
+        return HtmlSanitizer::limpiar($html);
     }
 }
