@@ -75,6 +75,7 @@ if (isset($db) && $db instanceof PDO && !empty($user_id)) {
 $NAV_LINKS = [
     'dashboard'    => ['href' => 'profesor_dashboard.php',    'icon' => 'fa-home',          'label' => 'Dashboard'],
     'actividades'  => ['href' => 'gestionar_actividades.php', 'icon' => 'fa-tasks',          'label' => 'Actividades'],
+    'impartir_clase' => ['href' => 'impartir_clase.php',       'icon' => 'fa-chalkboard-teacher', 'label' => 'Impartir Clase'],
     'calificaciones' => ['href' => 'calificaciones.php',      'icon' => 'fa-star',           'label' => 'Calificaciones'],
     'estudiantes'  => ['href' => 'gestionar_estudiantes.php', 'icon' => 'fa-user-graduate',  'label' => 'Estudiantes'],
     'mensajes'     => ['href' => 'mensajes.php',               'icon' => 'fa-envelope',       'label' => 'Mensajes', 'badge' => $unreadMensajes ?: null],
