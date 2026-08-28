@@ -518,6 +518,7 @@ foreach ($secciones as $s) {
                                         <button class="btn btn-info" onclick="verProfesor(<?= $prof['id'] ?>)" title="Ver"><i class="fas fa-eye"></i></button>
                                         <button class="btn btn-warning" onclick="editarProfesor(<?= $prof['id'] ?>)" title="Editar"><i class="fas fa-edit"></i></button>
                                         <button class="btn btn-success" onclick="asignarMaterias(<?= $prof['id'] ?>)" title="Asignar"><i class="fas fa-book"></i></button>
+                                        <a class="btn btn-secondary" href="expediente_docente.php?id_profesor=<?= $prof['id'] ?>" title="Expediente Docente"><i class="fas fa-id-card"></i></a>
                                         <button class="btn btn-danger" onclick="eliminarProfesor(<?= $prof['id'] ?>, '<?= htmlspecialchars($prof['primer_nombre'] . ' ' . $prof['primer_apellido']) ?>')" title="Eliminar"><i class="fas fa-trash"></i></button>
                                     </div>
                                 </td>
