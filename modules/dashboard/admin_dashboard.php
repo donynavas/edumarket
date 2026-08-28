@@ -286,6 +286,9 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_asignaturas.php">
                     <i class="fas fa-book"></i> Asignaturas
                 </a>
+                <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/horario_clases.php">
+                    <i class="fas fa-calendar-week"></i> Horario
+                </a>
                 <a class="nav-link" href="<?= BASE_URL ?>/modules/admin/gestionar_matriculas.php">
                     <i class="fas fa-file-signature"></i> Matrículas
                 </a>
@@ -489,6 +492,13 @@ $actividad_reciente = $stmt->fetchAll(PDO::FETCH_ASSOC);
                 <a href="<?= BASE_URL ?>/modules/admin/reporte_general.php" class="quick-action">
                     <i class="fas fa-file-pdf"></i>
                     <small>Reportes</small>
+                </a>
+            </div>
+
+            <div class="col-md-2 col-4 mb-3">
+                <a href="<?= BASE_URL ?>/modules/admin/horario_clases.php" class="quick-action">
+                    <i class="fas fa-calendar-week"></i>
+                    <small>Horario</small>
                 </a>
             </div>
         </div>

@@ -22,12 +22,12 @@ $db = (new Database())->getConnection();
 
 try {
     if ($action == 'editar') {
-        $q = "SELECT s.id, s.nombre, s.id_grado, s.anno_lectivo, g.nombre as grado_nombre, g.nivel
+        $q = "SELECT s.id, s.nombre, s.id_grado, s.anno_lectivo, s.turno, g.nombre as grado_nombre, g.nivel
               FROM tbl_seccion s
               JOIN tbl_grado g ON s.id_grado = g.id
               WHERE s.id = :id AND s.id_institucion = :tid";
     } else {
-        $q = "SELECT s.id, s.nombre, s.anno_lectivo, g.nombre as grado_nombre, g.nivel,
+        $q = "SELECT s.id, s.nombre, s.anno_lectivo, s.turno, g.nombre as grado_nombre, g.nivel,
                      COUNT(DISTINCT m.id) as total_estudiantes
               FROM tbl_seccion s
               JOIN tbl_grado g ON s.id_grado = g.id

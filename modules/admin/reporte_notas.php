@@ -678,6 +678,9 @@ $estados_aprobacion = [
             <a class="nav-link" href="gestionar_asignaturas.php">
                 <i class="fas fa-book"></i> Asignaturas
             </a>
+            <a class="nav-link" href="horario_clases.php">
+                <i class="fas fa-calendar-week"></i> Horario
+            </a>
             <a class="nav-link" href="gestionar_matriculas.php">
                 <i class="fas fa-file-signature"></i> Matrículas
             </a>

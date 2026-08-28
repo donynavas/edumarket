@@ -60,6 +60,7 @@ class TenantGuard {
         'tbl_expediente_capacitacion'    => "JOIN tbl_profesor __r1 ON t.id_profesor = __r1.id",
         'tbl_expediente_experiencia'     => "JOIN tbl_profesor __r1 ON t.id_profesor = __r1.id",
         'tbl_expediente_documento'       => "JOIN tbl_profesor __r1 ON t.id_profesor = __r1.id",
+        'tbl_horario_clase'               => "JOIN tbl_asignacion_docente __r1 ON t.id_asignacion_docente = __r1.id JOIN tbl_profesor __r2 ON __r1.id_profesor = __r2.id",
     ];
 
     public static function assertOwner(PDO $db, string $table, int $recordId, string $idColumn = 'id'): void {

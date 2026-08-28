@@ -3,6 +3,7 @@ session_start();
 require_once __DIR__ . '/../../config/database.php';
 require_once __DIR__ . '/../../config/TenantGuard.php';
 require_once __DIR__ . '/../../config/CatalogoAcademico.php';
+require_once __DIR__ . '/../../config/CatalogoHorario.php';
 
 // Verificar que sea admin o director
 if (!isset($_SESSION['user_id']) || ($_SESSION['rol'] != 'admin' && $_SESSION['rol'] != 'director')) {
@@ -90,13 +91,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
             $id_grado = $_POST['id_grado'];
             $anno = $_POST['anno_lectivo'] ?? date('Y');
+            $turno = $_POST['turno'] ?? '';
+            if (!array_key_exists($turno, CatalogoHorario::TURNOS)) {
+                throw new Exception('El turno debe ser Matutino o Vespertino.');
+            }
 
             // La institución SIEMPRE se toma de la sesión del usuario autenticado,
             // nunca de un valor enviado por el cliente (evita asignar secciones a
             // otra institución vía manipulación del formulario).
             try {
-                $query = "INSERT INTO tbl_seccion (nombre, id_grado, id_institucion, anno_lectivo) VALUES (:nombre, :grado, :inst, :anno)";
-                $db->prepare($query)->execute([':nombre' => $nombre, ':grado' => $id_grado, ':inst' => $tid, ':anno' => $anno]);
+                $query = "INSERT INTO tbl_seccion (nombre, id_grado, id_institucion, anno_lectivo, turno) VALUES (:nombre, :grado, :inst, :anno, :turno)";
+                $db->prepare($query)->execute([':nombre' => $nombre, ':grado' => $id_grado, ':inst' => $tid, ':anno' => $anno, ':turno' => $turno]);
             } catch (PDOException $e) {
                 if ($e->getCode() == 23000) {
                     throw new Exception('Esa sección ya existe para este grado y año.');
@@ -118,12 +123,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
             $id_grado = $_POST['id_grado'];
             $anno = $_POST['anno_lectivo'];
+            $turno = $_POST['turno'] ?? '';
+            if (!array_key_exists($turno, CatalogoHorario::TURNOS)) {
+                throw new Exception('El turno debe ser Matutino o Vespertino.');
+            }
 
             TenantGuard::assertOwner($db, 'tbl_seccion', $id);
 
             try {
-                $query = "UPDATE tbl_seccion SET nombre = :nombre, id_grado = :grado, anno_lectivo = :anno WHERE id = :id AND id_institucion = :tid";
-                $db->prepare($query)->execute([':nombre' => $nombre, ':grado' => $id_grado, ':anno' => $anno, ':id' => $id, ':tid' => $tid]);
+                $query = "UPDATE tbl_seccion SET nombre = :nombre, id_grado = :grado, anno_lectivo = :anno, turno = :turno WHERE id = :id AND id_institucion = :tid";
+                $db->prepare($query)->execute([':nombre' => $nombre, ':grado' => $id_grado, ':anno' => $anno, ':turno' => $turno, ':id' => $id, ':tid' => $tid]);
             } catch (PDOException $e) {
                 if ($e->getCode() == 23000) {
                     throw new Exception('Esa sección ya existe para este grado y año.');
@@ -192,7 +201,7 @@ $nombres_existentes = $db->query("SELECT nombre FROM tbl_grado")->fetchAll(PDO::
 $grados_disponibles = array_diff_key(CatalogoAcademico::GRADOS, array_flip($nombres_existentes));
 
 // Secciones
-$stmt_sec = $db->prepare("SELECT s.id, s.nombre, s.anno_lectivo, g.nombre as grado_nombre, g.nivel,
+$stmt_sec = $db->prepare("SELECT s.id, s.nombre, s.anno_lectivo, s.turno, g.nombre as grado_nombre, g.nivel,
                         COUNT(DISTINCT m.id) as total_estudiantes
                         FROM tbl_seccion s
                         JOIN tbl_grado g ON s.id_grado = g.id
@@ -268,6 +277,7 @@ $anno_actual = date('Y');
             <a class="nav-link" href="gestionar_profesores.php"><i class="fas fa-chalkboard-teacher"></i> Profesores</a>
             <a class="nav-link active" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
+            <a class="nav-link" href="horario_clases.php"><i class="fas fa-calendar-week"></i> Horario</a>
             <a class="nav-link" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
             <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
             <a class="nav-link" href="manual_convivencia.php"><i class="fas fa-handshake"></i> Convivencia Escolar</a>
@@ -411,6 +421,7 @@ $anno_actual = date('Y');
                                 <th>Sección</th>
                                 <th>Grado</th>
                                 <th>Nivel</th>
+                                <th>Turno</th>
                                 <th>Año Lectivo</th>
                                 <th>Estudiantes</th>
                                 <th class="no-print">Acciones</th>
@@ -424,6 +435,7 @@ $anno_actual = date('Y');
                                 <td class="fw-bold"><?= htmlspecialchars($s['nombre']) ?></td>
                                 <td><?= htmlspecialchars($s['grado_nombre']) ?></td>
                                 <td><span class="badge-nivel <?= $s['nivel'] ?>"><?= $niveles[$s['nivel']] ?? $s['nivel'] ?></span></td>
+                                <td><?= $s['turno'] ? htmlspecialchars(CatalogoHorario::TURNOS[$s['turno']] ?? $s['turno']) : '<span class="text-muted">Sin definir</span>' ?></td>
                                 <td><?= $s['anno_lectivo'] ?></td>
                                 <td><span class="badge bg-success"><?= $s['total_estudiantes'] ?></span></td>
                                 <td class="no-print">
@@ -515,6 +527,16 @@ $anno_actual = date('Y');
                                 <option value="">Elegir grado y año primero</option>
                             </select>
                             <small class="form-text text-muted">Solo se listan las letras (A-M) que aún no existen para ese grado y año.</small>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Turno *</label>
+                            <select name="turno" id="turno_seccion" class="form-select" required>
+                                <option value="">Seleccionar</option>
+                                <?php foreach (CatalogoHorario::TURNOS as $k => $v): ?>
+                                <option value="<?= $k ?>"><?= $v ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <small class="form-text text-muted">Todo el horario de esta sección hereda este turno.</small>
                         </div>
                         <?php if ($institucion): ?>
                         <input type="hidden" name="id_institucion" value="<?= $institucion['id'] ?>">
@@ -740,8 +762,9 @@ $anno_actual = date('Y');
                             <span class="badge bg-${s.nivel === 'basica' ? 'success' : 'warning'}">${nivel}</span>
                         </div>
                         <div class="row g-3">
-                            <div class="col-6"><div class="p-3 bg-light rounded text-center"><i class="fas fa-calendar text-primary fa-2x mb-2"></i><h5>${s.anno_lectivo}</h5><small class="text-muted">Año Lectivo</small></div></div>
-                            <div class="col-6"><div class="p-3 bg-light rounded text-center"><i class="fas fa-user-graduate text-success fa-2x mb-2"></i><h5>${s.total_estudiantes||0}</h5><small class="text-muted">Estudiantes</small></div></div>
+                            <div class="col-4"><div class="p-3 bg-light rounded text-center"><i class="fas fa-calendar text-primary fa-2x mb-2"></i><h5>${s.anno_lectivo}</h5><small class="text-muted">Año Lectivo</small></div></div>
+                            <div class="col-4"><div class="p-3 bg-light rounded text-center"><i class="fas fa-clock text-warning fa-2x mb-2"></i><h5>${s.turno ? (s.turno === 'matutino' ? 'Matutino' : 'Vespertino') : 'Sin definir'}</h5><small class="text-muted">Turno</small></div></div>
+                            <div class="col-4"><div class="p-3 bg-light rounded text-center"><i class="fas fa-user-graduate text-success fa-2x mb-2"></i><h5>${s.total_estudiantes||0}</h5><small class="text-muted">Estudiantes</small></div></div>
                         </div>`);
                 } else {
                     $('#infoSeccionContent').html(`<div class="alert alert-danger text-center"><i class="fas fa-exclamation-triangle fa-3x mb-3"></i><p>${res.message||'Error'}</p></div>`);
@@ -761,6 +784,7 @@ $anno_actual = date('Y');
                     $('#id_seccion').val(s.id);
                     $('#id_grado_seccion').val(s.id_grado);
                     $('#anno_lectivo').val(s.anno_lectivo);
+                    $('#turno_seccion').val(s.turno || '');
                     letraPropiaAlEditar = s.nombre;
                     actualizarLetrasDisponibles();
                     $('#nombre_seccion').val(s.nombre);
