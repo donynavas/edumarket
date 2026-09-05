@@ -22,6 +22,8 @@ require_once __DIR__ . '/../../config/PeriodoHelper.php';
 require_once __DIR__ . '/../../config/CuadroNotasHelper.php';
 require_once __DIR__ . '/../../config/ActividadHelper.php';
 require_once __DIR__ . '/../../config/HtmlSanitizer.php';
+require_once __DIR__ . '/../../config/HorarioHelper.php';
+require_once __DIR__ . '/../../config/ForoHelper.php';
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] != 'profesor') {
     header("Location: " . BASE_URL . "/login.php");
@@ -223,6 +225,56 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $mensaje = $etiquetas[$accion] . ' creada y vinculada a esta clase.';
             $tipo_mensaje = 'success';
 
+        } elseif ($accion === 'generar_sesiones') {
+            $idAsignacionPost = (int) ($_POST['id_asignacion'] ?? 0);
+            $asigInfo = resolverAsignacionPropia($db, $idAsignacionPost, $id_profesor);
+            if (!$asigInfo) {
+                throw new Exception('No tiene permiso para esta asignación.');
+            }
+            $fechaInicioPost = trim($_POST['fecha_inicio'] ?? '');
+            $fechaFinPost = trim($_POST['fecha_fin'] ?? '');
+            $resultado = HorarioHelper::generarSesiones($db, $tid, $idAsignacionPost, $user_id, $fechaInicioPost, $fechaFinPost);
+
+            $id_asignacion_filtro = $idAsignacionPost;
+            $id_clase = 0;
+            if ($resultado['creadas'] > 0) {
+                $mensaje = 'Se generaron ' . $resultado['creadas'] . ' sesión(es) según el horario de esta asignación.'
+                    . ($resultado['omitidas'] > 0 ? ' Se omitieron ' . $resultado['omitidas'] . ' fecha(s) que ya tenían una clase registrada.' : '');
+                $tipo_mensaje = 'success';
+            } else {
+                $mensaje = 'No se generó ninguna sesión nueva'
+                    . ($resultado['omitidas'] > 0 ? ' -- las ' . $resultado['omitidas'] . ' fecha(s) del rango ya tenían una clase registrada.' : ' en ese rango de fechas (revisa que coincida con los días del horario).');
+                $tipo_mensaje = 'warning';
+            }
+
+        } elseif ($accion === 'publicar_foro_mensaje') {
+            $idClasePost = (int) ($_POST['id_clase'] ?? 0);
+            $claseActual = resolverClasePropia($db, $idClasePost, $tid, $id_profesor);
+            if (!$claseActual) {
+                throw new Exception('No tiene permiso para publicar en esta clase.');
+            }
+            ForoHelper::publicar($db, $tid, $idClasePost, $user_id, 'profesor', $_POST['mensaje'] ?? '');
+            $id_clase = $idClasePost;
+            $id_asignacion_filtro = (int) $claseActual['id_asignacion_docente'];
+            $mensaje = 'Mensaje publicado en el foro de la clase.';
+            $tipo_mensaje = 'success';
+
+        } elseif ($accion === 'eliminar_foro_mensaje') {
+            $idClasePost = (int) ($_POST['id_clase'] ?? 0);
+            $claseActual = resolverClasePropia($db, $idClasePost, $tid, $id_profesor);
+            if (!$claseActual) {
+                throw new Exception('No tiene permiso para moderar esta clase.');
+            }
+            $idMensajePost = (int) ($_POST['id_mensaje'] ?? 0);
+            // El mensaje debe pertenecer a ESTA clase -- evita que, con un id
+            // adivinado, se borre un mensaje de otra clase (propia o ajena).
+            $db->prepare("DELETE FROM tbl_foro_mensaje WHERE id = :id AND id_clase = :clase")
+               ->execute([':id' => $idMensajePost, ':clase' => $idClasePost]);
+            $id_clase = $idClasePost;
+            $id_asignacion_filtro = (int) $claseActual['id_asignacion_docente'];
+            $mensaje = 'Mensaje del foro eliminado.';
+            $tipo_mensaje = 'warning';
+
         } elseif ($accion === 'eliminar_clase') {
             $idClasePost = (int) ($_POST['id_clase'] ?? 0);
             $claseActual = resolverClasePropia($db, $idClasePost, $tid, $id_profesor);
@@ -252,11 +304,15 @@ $periodos_cuadro = [];
 $casillas_cuadro = [];
 if ($asignacion_filtro_info) {
     PeriodoHelper::asegurar($db, $tid, (int) $asignacion_filtro_info['anno']);
-    $stmtPerCN = $db->prepare("SELECT id, numero, nombre FROM tbl_periodo WHERE id_institucion = :tid AND anno = :anno AND nivel = :nivel ORDER BY numero");
+    $stmtPerCN = $db->prepare("SELECT id, numero, nombre, fecha_inicio, fecha_fin FROM tbl_periodo WHERE id_institucion = :tid AND anno = :anno AND nivel = :nivel ORDER BY numero");
     $stmtPerCN->execute([':tid' => $tid, ':anno' => $asignacion_filtro_info['anno'], ':nivel' => $asignacion_filtro_info['nivel_grado']]);
     $periodos_cuadro = $stmtPerCN->fetchAll(PDO::FETCH_ASSOC);
     $casillas_cuadro = CuadroNotasHelper::casillasDisponibles($asignacion_filtro_info['nivel_grado']);
 }
+
+// ===== DÍAS CON HORARIO (para "Generar sesiones del período") =====
+$dias_horario_asignacion = $id_asignacion_filtro ? HorarioHelper::diasConHorario($db, $id_asignacion_filtro) : [];
+$dias_horario_nombres = array_map(fn($d) => CatalogoHorario::DIAS_SEMANA[$d] ?? $d, $dias_horario_asignacion);
 
 // ===== CLASE ACTUAL (si hay una seleccionada/recién guardada) =====
 $clase = $id_clase > 0 ? resolverClasePropia($db, $id_clase, $tid, $id_profesor) : null;
@@ -265,10 +321,13 @@ if (!$clase) {
 }
 
 $recursos = [];
+$mensajesForo = [];
 if ($clase) {
     $stmtRec = $db->prepare("SELECT * FROM tbl_clase_recurso WHERE id_clase = :id ORDER BY orden, id");
     $stmtRec->execute([':id' => $clase['id']]);
     $recursos = $stmtRec->fetchAll(PDO::FETCH_ASSOC);
+
+    $mensajesForo = ForoHelper::mensajesDeClase($db, $clase['id']);
 }
 
 // Actividades ya vinculadas (para mostrar título/estado junto a cada botón de Cierre).
@@ -383,10 +442,15 @@ require __DIR__ . '/partials/header.php';
                         <?php endforeach; ?>
                     </select>
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-2">
                     <a href="impartir_clase.php?asignacion=<?= $id_asignacion_filtro ?>" class="btn btn-outline-primary w-100">
                         <i class="fas fa-plus"></i> Nueva Clase
                     </a>
+                </div>
+                <div class="col-md-2">
+                    <button type="button" class="btn btn-outline-success w-100" data-bs-toggle="modal" data-bs-target="#modalGenerarSesiones">
+                        <i class="fas fa-calendar-plus"></i> Generar sesiones
+                    </button>
                 </div>
             </form>
         </div>
@@ -494,6 +558,41 @@ require __DIR__ . '/partials/header.php';
                             <?php if ($actividadesVinculadas['extra']): ?><small class="d-block text-center text-success mt-1"><i class="fas fa-check-circle"></i> <?= htmlspecialchars($actividadesVinculadas['extra']['titulo']) ?></small><?php endif; ?>
                         </div>
                     </div>
+
+                    <!-- FORO DE LA CLASE -->
+                    <hr>
+                    <h5 class="mb-3" id="foro"><i class="fas fa-comments"></i> Foro de la Clase</h5>
+                    <p class="text-muted small no-print">Visible para los estudiantes matriculados en <?= htmlspecialchars($asignacion_filtro_info['grado_nombre'] ?? '') ?> <?= htmlspecialchars($asignacion_filtro_info['seccion_nombre'] ?? '') ?>. Comparte algo o responde lo que publiquen.</p>
+                    <div class="mb-3" style="max-height: 320px; overflow-y: auto;">
+                        <?php if (empty($mensajesForo)): ?>
+                        <p class="text-muted small">Todavía no hay mensajes en el foro de esta clase.</p>
+                        <?php else: ?>
+                        <?php foreach ($mensajesForo as $fm): ?>
+                        <div class="d-flex justify-content-between align-items-start mb-2 pb-2 border-bottom">
+                            <div>
+                                <strong class="small"><?= htmlspecialchars(trim($fm['primer_nombre'] . ' ' . $fm['primer_apellido'])) ?></strong>
+                                <span class="badge <?= $fm['autor_rol'] === 'profesor' ? 'bg-primary' : 'bg-secondary' ?> ms-1"><?= $fm['autor_rol'] === 'profesor' ? 'Docente' : 'Estudiante' ?></span>
+                                <span class="text-muted small ms-1"><?= date('d/m/Y h:i A', strtotime($fm['created_at'])) ?></span>
+                                <div class="small" style="white-space: pre-wrap;"><?= htmlspecialchars($fm['mensaje']) ?></div>
+                            </div>
+                            <button type="button" class="btn btn-sm text-danger p-0 ms-2 no-print" title="Eliminar mensaje" onclick="eliminarMensajeForo(<?= $fm['id'] ?>)">&times;</button>
+                        </div>
+                        <?php endforeach; ?>
+                        <?php endif; ?>
+                    </div>
+                    <form method="POST" class="no-print">
+                        <input type="hidden" name="accion" value="publicar_foro_mensaje">
+                        <input type="hidden" name="id_clase" value="<?= $clase['id'] ?>">
+                        <div class="input-group">
+                            <textarea name="mensaje" class="form-control" rows="2" maxlength="3000" placeholder="Escribe un mensaje para tus estudiantes..." required></textarea>
+                            <button type="submit" class="btn btn-success"><i class="fas fa-paper-plane"></i> Publicar</button>
+                        </div>
+                    </form>
+                    <form method="POST" id="formEliminarMensajeForo" class="d-none">
+                        <input type="hidden" name="accion" value="eliminar_foro_mensaje">
+                        <input type="hidden" name="id_clase" value="<?= $clase['id'] ?>">
+                        <input type="hidden" name="id_mensaje" id="eliminarMensajeForoId">
+                    </form>
                     <?php endif; ?>
                 </div>
             </div>
@@ -522,6 +621,68 @@ require __DIR__ . '/partials/header.php';
                     </a>
                     <?php endforeach; ?>
                     <?php endif; ?>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal Generar sesiones del período -->
+        <div class="modal fade" id="modalGenerarSesiones" tabindex="-1">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header bg-success text-white">
+                        <h5 class="modal-title"><i class="fas fa-calendar-plus"></i> Generar sesiones del período</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    </div>
+                    <form method="POST">
+                        <div class="modal-body">
+                            <input type="hidden" name="accion" value="generar_sesiones">
+                            <input type="hidden" name="id_asignacion" value="<?= $id_asignacion_filtro ?>">
+                            <?php if (empty($dias_horario_asignacion)): ?>
+                            <div class="alert alert-warning small mb-0">
+                                <i class="fas fa-exclamation-triangle"></i>
+                                Esta asignación todavía no tiene ningún día configurado en
+                                <strong>Horario de Clases</strong>. Agrégale su horario primero
+                                y vuelve aquí para generar las sesiones automáticamente.
+                            </div>
+                            <?php else: ?>
+                            <p class="text-muted small">
+                                Crea una fila de bitácora (en borrador) por cada
+                                <strong><?= htmlspecialchars(implode(', ', $dias_horario_nombres)) ?></strong>
+                                dentro del rango de fechas, según el horario ya configurado para
+                                <?= htmlspecialchars($asignacion_filtro_info['asignatura_nombre'] ?? '') ?> -
+                                <?= htmlspecialchars($asignacion_filtro_info['grado_nombre'] ?? '') ?> <?= htmlspecialchars($asignacion_filtro_info['seccion_nombre'] ?? '') ?>.
+                                Las fechas que ya tengan una clase registrada se omiten (no duplica).
+                            </p>
+                            <?php if (!empty($periodos_cuadro)): ?>
+                            <div class="mb-3">
+                                <label class="form-label small text-muted">Rellenar con un período (opcional)</label>
+                                <select class="form-select" id="selectPeriodoSesiones">
+                                    <option value="">-- Elegir fechas manualmente --</option>
+                                    <?php foreach ($periodos_cuadro as $p): ?>
+                                    <option value="<?= htmlspecialchars($p['fecha_inicio'] ?? '') ?>|<?= htmlspecialchars($p['fecha_fin'] ?? '') ?>"><?= htmlspecialchars($p['nombre']) ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <?php endif; ?>
+                            <div class="row g-3">
+                                <div class="col-md-6">
+                                    <label class="form-label">Fecha inicio *</label>
+                                    <input type="date" name="fecha_inicio" id="sesionesFechaInicio" class="form-control" required>
+                                </div>
+                                <div class="col-md-6">
+                                    <label class="form-label">Fecha fin *</label>
+                                    <input type="date" name="fecha_fin" id="sesionesFechaFin" class="form-control" required>
+                                </div>
+                            </div>
+                            <?php endif; ?>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                            <?php if (!empty($dias_horario_asignacion)): ?>
+                            <button type="submit" class="btn btn-success"><i class="fas fa-calendar-plus"></i> Generar</button>
+                            <?php endif; ?>
+                        </div>
+                    </form>
                 </div>
             </div>
         </div>
@@ -706,6 +867,12 @@ require __DIR__ . '/partials/header.php';
             document.getElementById('formEliminarClase').submit();
         }
 
+        function eliminarMensajeForo(id) {
+            if (!confirm('¿Eliminar este mensaje del foro?')) return;
+            document.getElementById('eliminarMensajeForoId').value = id;
+            document.getElementById('formEliminarMensajeForo').submit();
+        }
+
         function eliminarRecurso(id) {
             if (!confirm('¿Quitar este recurso?')) return;
             fetch('api/clase_recurso.php', {
@@ -738,6 +905,17 @@ require __DIR__ . '/partials/header.php';
                     else { document.getElementById('recursoError').textContent = data.message || 'No se pudo agregar el recurso'; }
                 })
                 .catch(() => { document.getElementById('recursoError').textContent = 'Error de conexión'; });
+        });
+
+        // Al elegir un período en el modal "Generar sesiones", rellena las
+        // fechas de inicio/fin con las de ese período -- siguen siendo
+        // editables a mano después, por si el profesor quiere un rango
+        // distinto (ej. solo la primera mitad del período).
+        document.getElementById('selectPeriodoSesiones')?.addEventListener('change', function () {
+            if (!this.value) return;
+            const [inicio, fin] = this.value.split('|');
+            if (inicio) document.getElementById('sesionesFechaInicio').value = inicio;
+            if (fin) document.getElementById('sesionesFechaFin').value = fin;
         });
     </script>
 </body>

@@ -22,13 +22,13 @@ $profesor = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
 $id_profesor = $profesor['id'] ?? 0;
 
 // Obtener asignaciones del profesor
-$stmt = $db->prepare("SELECT ad.id, asig.nombre as asignatura, CONCAT(g.nombre, ' - ', s.nombre) as clase
+$stmt = $db->prepare("SELECT ad.id, ad.anno, asig.nombre as asignatura, CONCAT(g.nombre, ' - ', s.nombre) as clase
                       FROM tbl_asignacion_docente ad
                       JOIN tbl_asignatura asig ON ad.id_asignatura = asig.id
                       JOIN tbl_seccion s ON ad.id_seccion = s.id
                       JOIN tbl_grado g ON s.id_grado = g.id
                       WHERE ad.id_profesor = :prof AND asig.id_institucion = :tid
-                      ORDER BY asig.nombre");
+                      ORDER BY asig.nombre, ad.anno DESC");
 $stmt->execute([':prof' => $id_profesor, ':tid' => $tid]);
 $asignaciones = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
@@ -106,7 +106,7 @@ require __DIR__ . '/partials/header.php';
                                     <option value="">Seleccionar</option>
                                     <?php foreach ($asignaciones as $asig): ?>
                                     <option value="<?= $asig['id'] ?>" <?= $id_asignacion == $asig['id'] ? 'selected' : '' ?>>
-                                        <?= htmlspecialchars($asig['asignatura']) ?> - <?= htmlspecialchars($asig['clase']) ?>
+                                        <?= htmlspecialchars($asig['asignatura']) ?> - <?= htmlspecialchars($asig['clase']) ?> (<?= htmlspecialchars($asig['anno']) ?>)
                                     </option>
                                     <?php endforeach; ?>
                                 </select>
@@ -351,9 +351,9 @@ require __DIR__ . '/partials/header.php';
             };
             
             const config = tipos[tipo];
-            
+
             return `
-                <div class="question-card" id="pregunta-${numero}">
+                <div class="question-card" id="pregunta-${numero}" data-tipo="${tipo}" data-label="${config.label}">
                     <div class="d-flex justify-content-between align-items-start mb-3">
                         <h6 class="mb-0">
                             <span class="badge bg-primary me-2">P${numero}</span>
@@ -423,18 +423,29 @@ require __DIR__ . '/partials/header.php';
         function guardarExamen() {
             const formData = new FormData(document.getElementById('formExamenConfig'));
             const preguntas = document.querySelectorAll('.question-card');
-            
+
             if (preguntas.length === 0) {
                 alert('Debes agregar al menos una pregunta');
                 return;
             }
-            
-            // Recopilar datos de preguntas
-            preguntas.forEach((preg, index) => {
-                const num = index + 1;
-                // Los datos ya están en el form por los name="pregunta[num][campo]"
+
+            // Los campos de las preguntas (name="pregunta[num][campo]") viven
+            // dentro de #preguntas-container, que está FUERA de
+            // <form id="formExamenConfig"> (ese form se cierra antes de la
+            // tarjeta "Agregar Pregunta" -- ver el HTML de arriba). new
+            // FormData(form) sólo recoge descendientes del propio <form>, así
+            // que sin este paso NINGÚN campo de pregunta llegaba nunca al
+            // servidor: "Guardar Examen" guardaba la configuración pero el
+            // examen quedaba con 0 preguntas siempre, y si ya tenía preguntas
+            // de una edición anterior, la próxima vez que se guardara las
+            // borraba sin reemplazarlas (guardar_examen.php borra las
+            // preguntas existentes antes de reinsertar las que reciba).
+            document.querySelectorAll('#preguntas-container input, #preguntas-container textarea, #preguntas-container select').forEach(el => {
+                if (!el.name) return;
+                if ((el.type === 'radio' || el.type === 'checkbox') && !el.checked) return;
+                formData.append(el.name, el.value);
             });
-            
+
             // Agregar ID del examen si estamos editando
             <?php if ($examen_id): ?>
             formData.append('examen_id', <?= $examen_id ?>);
@@ -462,30 +473,97 @@ require __DIR__ . '/partials/header.php';
             });
         }
         
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str ?? '';
+            return div.innerHTML;
+        }
+
+        // Arma el contenido específico de cada tipo de pregunta (opciones,
+        // verdadero/falso, espacios a completar, pares a relacionar, o la
+        // respuesta esperada) -- antes la vista previa sólo mostraba el
+        // enunciado con un genérico "[Respuesta del estudiante aquí]" sin
+        // importar el tipo, así que agregar 4 opciones de respuesta y darle
+        // "Vista Previa Completa" no mostraba nada de eso. Esta vista es sólo
+        // para el profesor mientras arma el examen, así que además de las
+        // opciones se marca cuál está seleccionada como correcta.
+        function previewCuerpoPregunta(preg, tipo) {
+            if (tipo === 'opcion_multiple') {
+                const opciones = preg.querySelectorAll('input[name*="[opciones]"]');
+                const correctaInput = preg.querySelector('input[name*="[correcta]"]:checked');
+                const correctaValor = correctaInput ? correctaInput.value : null;
+                if (opciones.length === 0) return '<div class="text-muted fst-italic small">Sin opciones agregadas todavía</div>';
+                let html = '<ul class="list-unstyled mb-0">';
+                opciones.forEach((op, i) => {
+                    const esCorrecta = correctaValor !== null && String(i) === String(correctaValor);
+                    const texto = escapeHtml(op.value) || `<span class="text-muted fst-italic">Opción ${i + 1} sin texto</span>`;
+                    html += `<li class="mb-1">${esCorrecta ? '<i class="fas fa-check-circle text-success me-1"></i>' : '<i class="far fa-circle text-muted me-1"></i>'}${texto}</li>`;
+                });
+                html += '</ul>';
+                return html;
+            }
+            if (tipo === 'verdadero_falso') {
+                const seleccionado = preg.querySelector('input[name*="[correcta]"]:checked')?.value || null;
+                const marca = (v) => seleccionado === v ? '<i class="fas fa-check-circle text-success me-1"></i>' : '<i class="far fa-circle text-muted me-1"></i>';
+                return `<div>${marca('V')}Verdadero</div><div>${marca('F')}Falso</div>`;
+            }
+            if (tipo === 'completar') {
+                const enunciado = preg.querySelector('textarea[name*="enunciado"]')?.value || '';
+                const conBlancos = escapeHtml(enunciado).replace(/\[(.*?)\]/g, '<u>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</u>');
+                const respuestas = [...enunciado.matchAll(/\[(.*?)\]/g)].map(m => m[1]).filter(r => r.trim() !== '');
+                let html = `<p class="mb-2">${conBlancos}</p>`;
+                if (respuestas.length) {
+                    html += `<div class="text-muted small">Respuesta(s) correcta(s): ${respuestas.map(escapeHtml).join(', ')}</div>`;
+                }
+                return html;
+            }
+            if (tipo === 'respuesta_corta') {
+                const correcta = preg.querySelector('input[name*="[correcta]"]')?.value || '';
+                return `<div class="border rounded p-2 text-muted fst-italic mb-2">[Respuesta del estudiante aquí]</div>` +
+                       (correcta.trim() !== '' ? `<div class="text-muted small">Respuesta correcta: ${escapeHtml(correcta)}</div>` : '<div class="text-muted small fst-italic">Todavía sin respuesta correcta definida</div>');
+            }
+            if (tipo === 'relacionar') {
+                const izquierda = [...preg.querySelectorAll('input[name*="[izquierda]"]')].map(i => i.value);
+                const derecha = [...preg.querySelectorAll('input[name*="[derecha]"]')].map(i => i.value);
+                const pares = Math.max(izquierda.length, derecha.length);
+                if (pares === 0) return '<div class="text-muted fst-italic small">Sin pares agregados todavía</div>';
+                let html = '<table class="table table-sm mb-0"><tbody>';
+                for (let i = 0; i < pares; i++) {
+                    const izq = escapeHtml(izquierda[i]) || '<span class="text-muted fst-italic">—</span>';
+                    const der = escapeHtml(derecha[i]) || '<span class="text-muted fst-italic">—</span>';
+                    html += `<tr><td>${izq}</td><td class="text-center text-muted"><i class="fas fa-arrows-alt-h"></i></td><td>${der}</td></tr>`;
+                }
+                html += '</tbody></table>';
+                return html;
+            }
+            return '<div class="text-muted fst-italic small">[Respuesta del estudiante aquí]</div>';
+        }
+
         function previewExamen() {
             const previewContent = document.getElementById('preview-content');
             const preguntas = document.querySelectorAll('.question-card');
-            
+
             if (preguntas.length === 0) {
                 previewContent.innerHTML = '<div class="text-center text-muted"><i class="fas fa-exclamation-circle fa-2x mb-2"></i><p>No hay preguntas para mostrar</p></div>';
                 return;
             }
-            
+
             let html = '<div class="p-3 bg-light rounded mb-3"><strong>Vista Previa del Examen</strong></div>';
-            
+
             preguntas.forEach((preg, index) => {
                 const enunciado = preg.querySelector('textarea[name*="enunciado"]')?.value || '';
-                const tipo = preg.querySelector('.badge')?.textContent || '';
-                
+                const tipo = preg.dataset.tipo || '';
+                const label = preg.dataset.label || tipo;
+
                 html += `
                     <div class="mb-3 p-3 border rounded">
-                        <small class="text-muted">Pregunta ${index + 1} - ${tipo}</small>
-                        <p class="mb-2">${enunciado}</p>
-                        <div class="text-muted fst-italic">[Respuesta del estudiante aquí]</div>
+                        <small class="text-muted">Pregunta ${index + 1} - ${escapeHtml(label)}</small>
+                        ${tipo !== 'completar' && enunciado.trim() !== '' ? `<p class="mb-2">${escapeHtml(enunciado)}</p>` : ''}
+                        ${previewCuerpoPregunta(preg, tipo)}
                     </div>
                 `;
             });
-            
+
             previewContent.innerHTML = html;
         }
         
@@ -516,10 +594,11 @@ function renderPregunta($preg, $numero) {
         }
     }
     
-    $html = '<div class="question-card" id="pregunta-'.$numero.'">';
+    $etiquetaTipo = ucfirst(str_replace('_', ' ', $preg['tipo']));
+    $html = '<div class="question-card" id="pregunta-'.$numero.'" data-tipo="'.htmlspecialchars($preg['tipo']).'" data-label="'.htmlspecialchars($etiquetaTipo).'">';
     $html .= '<div class="d-flex justify-content-between align-items-start mb-3">';
     $html .= '<h6 class="mb-0"><span class="badge bg-primary me-2">P'.$numero.'</span>';
-    
+
     $iconos = [
         'opcion_multiple' => 'fa-list',
         'verdadero_falso' => 'fa-check-circle',

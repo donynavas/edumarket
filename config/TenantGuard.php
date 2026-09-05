@@ -61,6 +61,11 @@ class TenantGuard {
         'tbl_expediente_experiencia'     => "JOIN tbl_profesor __r1 ON t.id_profesor = __r1.id",
         'tbl_expediente_documento'       => "JOIN tbl_profesor __r1 ON t.id_profesor = __r1.id",
         'tbl_horario_clase'               => "JOIN tbl_asignacion_docente __r1 ON t.id_asignacion_docente = __r1.id JOIN tbl_profesor __r2 ON __r1.id_profesor = __r2.id",
+        // tbl_nota_periodo no tiene ningún llamado a assertOwner() todavía
+        // (guardar_nota_periodo.php valida por otra vía), pero se agrega aquí
+        // preventivamente para que una futura acción sobre esta tabla no
+        // falle con "Unknown column 'id_institucion'" en vez de aislar bien.
+        'tbl_nota_periodo'                => "JOIN tbl_asignacion_docente __r1 ON t.id_asignacion_docente = __r1.id JOIN tbl_profesor __r2 ON __r1.id_profesor = __r2.id",
     ];
 
     public static function assertOwner(PDO $db, string $table, int $recordId, string $idColumn = 'id'): void {

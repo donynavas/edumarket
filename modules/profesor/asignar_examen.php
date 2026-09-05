@@ -28,6 +28,69 @@ $profesor = $profesor_data ?: [];
 $mensaje = '';
 $tipo_mensaje = '';
 
+// Un examen creado aquí (tbl_examen) sólo es visible/tomable para los
+// estudiantes cuando existe una fila hermana en tbl_actividad (tipo='examen',
+// id_examen = este examen) -- es esa fila la que tbl_actividad-driven
+// actividades.php/calendario_evaluaciones.php/ver_materia.php realmente
+// consultan para mostrárselo al estudiante de la sección de esta asignación.
+// Antes, este módulo cambiaba el estado del examen (Publicar/Activar/Cerrar)
+// sin nunca crear esa fila, así que ningún examen creado aquí llegaba a
+// ningún estudiante aunque quedara "Activo". Se sincroniza automáticamente
+// a TODA la sección de la asignación (mismo criterio que ya usan Actividades,
+// Notas y Horario en el resto del sistema -- no hay selección de estudiantes
+// individuales en ningún otro módulo, así que agregar una aquí sería
+// inconsistente).
+function sincronizarActividadExamen(PDO $db, int $id_examen, string $nuevoEstadoExamen): void
+{
+    $stmt = $db->prepare("SELECT id_asignacion_docente, titulo, descripcion, instrucciones,
+                                  duracion_minutos, nota_maxima, fecha_programada, fecha_limite
+                           FROM tbl_examen WHERE id = :id");
+    $stmt->execute([':id' => $id_examen]);
+    $examen = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$examen) return;
+
+    $stmtAct = $db->prepare("SELECT id FROM tbl_actividad WHERE id_examen = :id_examen");
+    $stmtAct->execute([':id_examen' => $id_examen]);
+    $idActividad = $stmtAct->fetchColumn();
+
+    if ($idActividad) {
+        // Ya existe: mantener sincronizados estado y metadatos (por si el
+        // profesor editó título/fechas/nota en crear_examen.php después de
+        // publicar). tbl_actividad.estado usa las mismas palabras que
+        // tbl_examen.estado para este caso (programado/activo/cerrado), así
+        // que se copia directo sin tabla de traducción.
+        $stmt = $db->prepare("UPDATE tbl_actividad SET
+                estado = :estado, titulo = :titulo, descripcion = :descripcion,
+                fecha_programada = :fecha_prog, fecha_limite = :fecha_limite,
+                duracion_minutos = SEC_TO_TIME(:duracion * 60), nota_maxima = :nota_maxima
+            WHERE id = :id");
+        $stmt->execute([
+            ':estado' => $nuevoEstadoExamen, ':titulo' => $examen['titulo'], ':descripcion' => $examen['descripcion'],
+            ':fecha_prog' => $examen['fecha_programada'], ':fecha_limite' => $examen['fecha_limite'],
+            ':duracion' => $examen['duracion_minutos'] ?: 60, ':nota_maxima' => $examen['nota_maxima'],
+            ':id' => $idActividad,
+        ]);
+    } elseif ($nuevoEstadoExamen !== 'borrador') {
+        // Primera vez que se publica (borrador -> programado/activo/cerrado
+        // directo): se crea la actividad recién ahora, nunca mientras el
+        // examen sigue en borrador (así un examen a medio construir no le
+        // aparece a nadie).
+        $stmt = $db->prepare("INSERT INTO tbl_actividad
+                (id_asignacion_docente, id_examen, titulo, descripcion, tipo,
+                 fecha_programada, fecha_limite, duracion_minutos, nota_maxima, contenido, estado)
+            VALUES
+                (:asig, :id_examen, :titulo, :descripcion, 'examen',
+                 :fecha_prog, :fecha_limite, SEC_TO_TIME(:duracion * 60), :nota_maxima, :contenido, :estado)");
+        $stmt->execute([
+            ':asig' => $examen['id_asignacion_docente'], ':id_examen' => $id_examen,
+            ':titulo' => $examen['titulo'], ':descripcion' => $examen['descripcion'],
+            ':fecha_prog' => $examen['fecha_programada'], ':fecha_limite' => $examen['fecha_limite'],
+            ':duracion' => $examen['duracion_minutos'] ?: 60, ':nota_maxima' => $examen['nota_maxima'],
+            ':contenido' => $examen['instrucciones'] ?: '', ':estado' => $nuevoEstadoExamen,
+        ]);
+    }
+}
+
 // ===== ACCIONES SOBRE EXÁMENES EXISTENTES (tbl_examen) =====
 // La creación/edición de contenido del examen (preguntas de los 5 tipos) se hace
 // en crear_examen.php; aquí sólo se gestiona el ciclo de vida (publicar/cerrar/eliminar)
@@ -38,7 +101,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
 
         $accion = $_POST['accion'];
 
-        if (in_array($accion, ['cambiar_estado', 'eliminar_examen'], true)) {
+        if (in_array($accion, ['cambiar_estado', 'eliminar_examen', 'resincronizar'], true)) {
             $id_examen = (int) $_POST['id_examen'];
 
             // El examen DEBE pertenecer a una asignación de ESTE profesor.
@@ -54,7 +117,24 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
                 throw new Exception('Este examen no le pertenece.');
             }
 
-            if ($accion == 'cambiar_estado') {
+            if ($accion == 'resincronizar') {
+                // Botón "Asignar" -- fuerza a que la fila hermana en
+                // tbl_actividad (la que de verdad consultan
+                // actividades.php/ver_materia.php/calendario_evaluaciones.php
+                // del lado estudiante) quede al día con el examen, usando el
+                // estado ACTUAL del examen (no cambia nada, solo re-sincroniza).
+                // Sirve como red de seguridad si por lo que sea la fila
+                // hermana nunca se creó o quedó desactualizada.
+                $estadoActual = $db->prepare("SELECT estado FROM tbl_examen WHERE id = :id");
+                $estadoActual->execute([':id' => $id_examen]);
+                $estadoExamen = $estadoActual->fetchColumn();
+                if ($estadoExamen === 'borrador') {
+                    throw new Exception('Este examen todavía está en Borrador -- publícalo primero.');
+                }
+                sincronizarActividadExamen($db, $id_examen, $estadoExamen);
+                $mensaje = 'Examen re-asignado a la sección. Ya debería verlo cualquier estudiante matriculado en esa sección/año.';
+                $tipo_mensaje = 'success';
+            } elseif ($accion == 'cambiar_estado') {
                 $nuevo_estado = $_POST['nuevo_estado'] ?? '';
                 $estados_validos = ['borrador', 'programado', 'activo', 'cerrado'];
                 if (!in_array($nuevo_estado, $estados_validos, true)) {
@@ -62,9 +142,22 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['accion'])) {
                 }
                 $stmt = $db->prepare("UPDATE tbl_examen SET estado = :estado WHERE id = :id");
                 $stmt->execute([':estado' => $nuevo_estado, ':id' => $id_examen]);
-                $mensaje = 'Estado del examen actualizado';
+                sincronizarActividadExamen($db, $id_examen, $nuevo_estado);
+                $mensaje = $nuevo_estado === 'programado'
+                    ? 'Examen publicado: ya es visible para los estudiantes de esa sección como "Programado".'
+                    : 'Estado del examen actualizado';
                 $tipo_mensaje = 'success';
             } else { // eliminar_examen
+                // Borrar primero la actividad hermana (si llegó a publicarse)
+                // y sus entregas/intentos, para no dejar filas huérfanas.
+                $stmtAct = $db->prepare("SELECT id FROM tbl_actividad WHERE id_examen = :id");
+                $stmtAct->execute([':id' => $id_examen]);
+                $idActividad = $stmtAct->fetchColumn();
+                if ($idActividad) {
+                    $db->prepare("DELETE FROM tbl_entrega_actividad WHERE id_actividad = :id")->execute([':id' => $idActividad]);
+                    $db->prepare("DELETE FROM tbl_actividad WHERE id = :id")->execute([':id' => $idActividad]);
+                }
+                $db->prepare("DELETE FROM tbl_intento_examen WHERE id_examen = :id")->execute([':id' => $id_examen]);
                 $stmt = $db->prepare("DELETE FROM tbl_opcion_respuesta WHERE id_pregunta IN (SELECT id FROM tbl_pregunta_examen WHERE id_examen = :id)");
                 $stmt->execute([':id' => $id_examen]);
                 $stmt = $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id");
@@ -109,7 +202,9 @@ $query = "SELECT
     a.nombre as asignatura,
     s.nombre as seccion,
     g.nombre as grado,
-    (SELECT COUNT(*) FROM tbl_pregunta_examen pe WHERE pe.id_examen = ex.id) as total_preguntas
+    ad.anno,
+    (SELECT COUNT(*) FROM tbl_pregunta_examen pe WHERE pe.id_examen = ex.id) as total_preguntas,
+    (SELECT COUNT(*) FROM tbl_matricula m WHERE m.id_seccion = ad.id_seccion AND m.anno = ad.anno AND m.estado = 'activo') as total_estudiantes
     FROM tbl_examen ex
     JOIN tbl_asignacion_docente ad ON ex.id_asignacion_docente = ad.id
     JOIN tbl_asignatura a ON ad.id_asignatura = a.id
@@ -214,6 +309,8 @@ require __DIR__ . '/partials/header.php';
                                 <th>Examen</th>
                                 <th>Asignatura</th>
                                 <th>Grado/Sección</th>
+                                <th>Año</th>
+                                <th>Estudiantes</th>
                                 <th>Preguntas</th>
                                 <th>Fecha Programada</th>
                                 <th>Fecha Límite</th>
@@ -232,6 +329,16 @@ require __DIR__ . '/partials/header.php';
                                 <td>
                                     <?= htmlspecialchars($examen['grado']) ?> -
                                     <?= htmlspecialchars($examen['seccion']) ?>
+                                </td>
+                                <td><?= htmlspecialchars($examen['anno']) ?></td>
+                                <td>
+                                    <?php if ((int) $examen['total_estudiantes'] === 0): ?>
+                                    <span class="badge bg-danger" title="Ningún estudiante está matriculado (activo) en esa sección para ese año -- revisa Grados/Secciones y Matrículas, o que la asignación no sea de un año viejo.">
+                                        <i class="fas fa-exclamation-triangle"></i> 0
+                                    </span>
+                                    <?php else: ?>
+                                    <span class="badge bg-secondary"><?= (int) $examen['total_estudiantes'] ?></span>
+                                    <?php endif; ?>
                                 </td>
                                 <td>
                                     <span class="badge bg-<?= $examen['total_preguntas'] > 0 ? 'secondary' : 'danger' ?>">
@@ -277,6 +384,15 @@ require __DIR__ . '/partials/header.php';
                                             <input type="hidden" name="nuevo_estado" value="cerrado">
                                             <button type="submit" class="btn btn-secondary" title="Cerrar">
                                                 <i class="fas fa-lock"></i>
+                                            </button>
+                                        </form>
+                                        <?php endif; ?>
+                                        <?php if ($examen['estado'] !== 'borrador'): ?>
+                                        <form method="POST" class="d-inline">
+                                            <input type="hidden" name="accion" value="resincronizar">
+                                            <input type="hidden" name="id_examen" value="<?= $examen['id'] ?>">
+                                            <button type="submit" class="btn btn-outline-primary" title="Asignar / re-sincronizar con la sección (usa esto si el examen no le aparece a los estudiantes)">
+                                                <i class="fas fa-share-square"></i>
                                             </button>
                                         </form>
                                         <?php endif; ?>

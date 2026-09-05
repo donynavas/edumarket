@@ -391,6 +391,7 @@ $anios = range(date('Y') - 1, date('Y') + 2);
             <a class="nav-link" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
             <a class="nav-link" href="horario_clases.php"><i class="fas fa-calendar-week"></i> Horario</a>
+            <a class="nav-link" href="carnet_estudiantil.php"><i class="fas fa-id-card"></i> Carnet Estudiantil</a>
             <a class="nav-link" href="gestionar_matriculas.php"><i class="fas fa-file-signature"></i> Matrículas</a>
             <a class="nav-link" href="cuadro_notas.php"><i class="fas fa-clipboard-list"></i> Cuadro de Notas</a>
             <a class="nav-link active" href="manual_convivencia.php"><i class="fas fa-handshake"></i> Convivencia Escolar</a>

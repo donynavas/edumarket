@@ -108,10 +108,23 @@ try {
     $orden = 1;
     
     foreach ($preguntas as $num => $preg) {
-        $enunciado = trim($preg['enunciado']);
-        if (empty($enunciado)) continue;
-        
+        $enunciado = trim($preg['enunciado'] ?? '');
         $tipo = determinarTipoPregunta($preg);
+
+        // En "relacionar" el enunciado es sólo una instrucción OPCIONAL
+        // ("Relaciona cada elemento..."); lo que hace válida la pregunta son
+        // sus pares izquierda/derecha, no el enunciado. Antes, dejar ese
+        // campo en blanco (el caso normal, ya que el placeholder no sugiere
+        // que sea obligatorio) hacía que la pregunta completa -- con todos
+        // sus pares ya escritos -- se descartara en silencio al guardar.
+        if ($tipo === 'relacionar') {
+            $izquierda = array_filter($preg['izquierda'] ?? [], fn($v) => trim($v) !== '');
+            $derecha = array_filter($preg['derecha'] ?? [], fn($v) => trim($v) !== '');
+            if (empty($izquierda) && empty($derecha)) continue;
+        } elseif (empty($enunciado)) {
+            continue;
+        }
+
         $puntaje = $preg['puntaje'] ?? 1;
         
         // Insertar pregunta
@@ -165,7 +178,29 @@ try {
         
         $orden++;
     }
-    
+
+    // Si este examen ya fue publicado (existe su fila hermana en
+    // tbl_actividad -- ver asignar_examen.php), mantener sincronizados los
+    // metadatos que el profesor acaba de editar aquí (título, fechas, nota
+    // máxima, duración). El estado de la actividad NO se toca desde aquí:
+    // eso lo controla exclusivamente asignar_examen.php (Publicar/Activar/Cerrar).
+    $stmtAct = $db->prepare("SELECT id FROM tbl_actividad WHERE id_examen = :id_examen");
+    $stmtAct->execute([':id_examen' => $examen_id]);
+    $idActividad = $stmtAct->fetchColumn();
+    if ($idActividad) {
+        $stmt = $db->prepare("UPDATE tbl_actividad SET
+                titulo = :titulo, descripcion = :descripcion,
+                fecha_programada = :fecha_prog, fecha_limite = :fecha_limite,
+                duracion_minutos = SEC_TO_TIME(:duracion * 60), nota_maxima = :nota_maxima
+            WHERE id = :id");
+        $stmt->execute([
+            ':titulo' => $titulo, ':descripcion' => $descripcion,
+            ':fecha_prog' => $fecha_programada, ':fecha_limite' => $fecha_limite,
+            ':duracion' => $duracion ?: 60, ':nota_maxima' => $nota_maxima,
+            ':id' => $idActividad,
+        ]);
+    }
+
     $db->commit();
     echo json_encode(['success' => true, 'examen_id' => $examen_id, 'message' => 'Examen guardado']);
     

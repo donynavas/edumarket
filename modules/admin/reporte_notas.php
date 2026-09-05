@@ -681,6 +681,9 @@ $estados_aprobacion = [
             <a class="nav-link" href="horario_clases.php">
                 <i class="fas fa-calendar-week"></i> Horario
             </a>
+            <a class="nav-link" href="carnet_estudiantil.php">
+                <i class="fas fa-id-card"></i> Carnet Estudiantil
+            </a>
             <a class="nav-link" href="gestionar_matriculas.php">
                 <i class="fas fa-file-signature"></i> Matrículas
             </a>

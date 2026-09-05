@@ -75,6 +75,13 @@ class ExpedienteDocenteHelper
         $ext = self::EXTENSIONES[$mime];
         $nombreArchivo = uniqid($prefijo, true) . '.' . $ext;
         $uploadDir = __DIR__ . '/../' . self::UPLOAD_DIR_RELATIVO;
+        // La carpeta puede no existir todavía en un despliegue nuevo (las
+        // carpetas vacías no viajan dentro del ZIP de entrega) -- se crea
+        // aquí mismo si hace falta, mismo criterio que ya usa
+        // modules/estudiante/actividades.php para su carpeta de subidas.
+        if (!is_dir($uploadDir) && !mkdir($uploadDir, 0755, true) && !is_dir($uploadDir)) {
+            throw new Exception('No se pudo crear la carpeta de subida del archivo.');
+        }
         if (!move_uploaded_file($file['tmp_name'], $uploadDir . $nombreArchivo)) {
             throw new Exception('No se pudo guardar el archivo.');
         }

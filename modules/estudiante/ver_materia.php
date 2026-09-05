@@ -15,6 +15,7 @@ $user_id = $_SESSION['user_id'];
 $tid = TenantGuard::id();
 
 require_once __DIR__ . '/../../config/MensajeHelper.php';
+require_once __DIR__ . '/../../config/ForoHelper.php';
 $totalNoLeidos = MensajeHelper::contarNoLeidos($db, (int) $user_id);
 
 // Obtener ID de la asignatura desde la URL
@@ -120,6 +121,12 @@ if (!$materia) {
     <?php
     exit;
 }
+
+// ===== BITÁCORA DE CLASES (con acceso al foro de cada una) =====
+// $id_asignacion ya quedó validado arriba (la consulta de $materia solo
+// devuelve fila si esta asignación es de este estudiante), así que aquí
+// es seguro listar sus clases directamente por ese id.
+$bitacoraClases = ForoHelper::bitacoraConForo($db, (int) $id_asignacion);
 
 // ===== OBTENER ACTIVIDADES DE LA MATERIA =====
 $filtro_tipo = $_GET['tipo'] ?? 'todos';
@@ -302,6 +309,35 @@ $tipos_actividad = [
                     <h3 class="text-primary mb-0"><?= number_format($promedio_materia, 1) ?></h3>
                     <small class="text-muted">Tu Promedio</small>
                 </div>
+            </div>
+        </div>
+
+        <!-- Clases y Foro -->
+        <div class="card-custom">
+            <div class="card-header bg-white py-3">
+                <h5 class="mb-0"><i class="fas fa-chalkboard"></i> Clases</h5>
+            </div>
+            <div class="card-body p-0">
+                <?php if (empty($bitacoraClases)): ?>
+                <div class="text-center py-4 text-muted">
+                    <p class="mb-0">Tu profesor todavía no ha registrado ninguna clase aquí.</p>
+                </div>
+                <?php else: ?>
+                <div class="list-group list-group-flush">
+                    <?php foreach ($bitacoraClases as $bc): ?>
+                    <a href="foro_clase.php?id_clase=<?= $bc['id'] ?>" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
+                        <span>
+                            <strong><?= $bc['numero_clase'] ? 'Clase ' . htmlspecialchars($bc['numero_clase']) : 'Clase' ?></strong>
+                            <span class="text-muted small ms-2"><?= date('d/m/Y', strtotime($bc['fecha_clase'])) ?></span>
+                        </span>
+                        <span>
+                            <?php if ((int) $bc['total_mensajes'] > 0): ?><span class="badge bg-success rounded-pill me-2"><?= (int) $bc['total_mensajes'] ?></span><?php endif; ?>
+                            <i class="fas fa-comments text-primary"></i> Foro
+                        </span>
+                    </a>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
             </div>
         </div>
 

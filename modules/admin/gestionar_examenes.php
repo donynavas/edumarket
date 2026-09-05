@@ -407,6 +407,7 @@ $estados_examen = [
             <a class="nav-link" href="gestionar_grados.php"><i class="fas fa-layer-group"></i> Grados/Secciones</a>
             <a class="nav-link" href="gestionar_asignaturas.php"><i class="fas fa-book"></i> Asignaturas</a>
             <a class="nav-link" href="horario_clases.php"><i class="fas fa-calendar-week"></i> Horario</a>
+            <a class="nav-link" href="carnet_estudiantil.php"><i class="fas fa-id-card"></i> Carnet Estudiantil</a>
             <a class="nav-link active" href="gestionar_examenes.php"><i class="fas fa-file-alt"></i> Exámenes</a>
             <a class="nav-link" href="calificaciones.php"><i class="fas fa-star"></i> Calificaciones</a>
             <a class="nav-link" href="manual_convivencia.php"><i class="fas fa-handshake"></i> Convivencia Escolar</a>

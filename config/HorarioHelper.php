@@ -144,4 +144,112 @@ class HorarioHelper
             );
         }
     }
+
+    /**
+     * Días de la semana (1=Lunes..5=Viernes, mismo criterio que
+     * CatalogoHorario::DIAS_SEMANA y que PHP date('N')) en los que esta
+     * asignación docente tiene clase programada según el Horario de
+     * Clases -- sin duplicados aunque tenga más de un bloque el mismo
+     * día (ej. una materia con doble hora un lunes solo cuenta "lunes"
+     * una vez, porque tbl_clase_impartida es una bitácora por FECHA, no
+     * por bloque). Devuelve un array vacío si la asignación todavía no
+     * tiene ningún horario asignado.
+     */
+    public static function diasConHorario(PDO $db, int $idAsignacionDocente): array
+    {
+        $stmt = $db->prepare(
+            "SELECT DISTINCT dia_semana FROM tbl_horario_clase WHERE id_asignacion_docente = :asig ORDER BY dia_semana"
+        );
+        $stmt->execute([':asig' => $idAsignacionDocente]);
+        return array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+    }
+
+    /**
+     * Genera automáticamente una fila de bitácora (tbl_clase_impartida,
+     * estado='borrador') por cada fecha entre $fechaInicio y $fechaFin
+     * cuyo día de la semana esté en el Horario de Clases de esta
+     * asignación -- idea tomada de "escuela" (Cursos::crearClases(), que
+     * recorre día a día un rango de fechas comparando contra el horario
+     * semanal), adaptada al modelo real de este proyecto: en vez de
+     * confiar en datos posteados, aquí SIEMPRE se relee el horario ya
+     * guardado en tbl_horario_clase (fuente única de verdad) y solo se
+     * usan $fechaInicio/$fechaFin como rango, evitando duplicar una
+     * sesión que ya exista para esa fecha (reintentar el mismo rango dos
+     * veces es un no-op para las fechas ya generadas).
+     *
+     * Devuelve ['creadas' => int, 'omitidas' => int] -- "omitidas" son
+     * fechas que caían en un día con horario pero que ya tenían una
+     * clase registrada para esta asignación.
+     *
+     * Lanza Exception si: la asignación no tiene ningún horario
+     * configurado, el rango es inválido (fin antes de inicio), o el
+     * rango supera un año (tope defensivo contra un typo de año que
+     * generaría miles de filas).
+     */
+    public static function generarSesiones(PDO $db, int $tid, int $idAsignacionDocente, int $userId, string $fechaInicio, string $fechaFin): array
+    {
+        $dias = self::diasConHorario($db, $idAsignacionDocente);
+        if (empty($dias)) {
+            throw new Exception('Esta asignación todavía no tiene ningún horario configurado. Ve a Horario de Clases y agrégale al menos un día antes de generar sesiones.');
+        }
+
+        $inicio = DateTime::createFromFormat('Y-m-d', $fechaInicio) ?: null;
+        $fin = DateTime::createFromFormat('Y-m-d', $fechaFin) ?: null;
+        if (!$inicio || !$fin) {
+            throw new Exception('Fecha de inicio o fin inválida.');
+        }
+        if ($fin < $inicio) {
+            throw new Exception('La fecha de fin no puede ser anterior a la fecha de inicio.');
+        }
+        if ($inicio->diff($fin)->days > 366) {
+            throw new Exception('El rango de fechas no puede superar un año -- revisa que las fechas sean correctas.');
+        }
+
+        // Fechas que ya tienen una clase registrada para esta asignación,
+        // para no duplicar si el director/profesor repite el mismo rango.
+        $stmtExistentes = $db->prepare("SELECT fecha_clase FROM tbl_clase_impartida WHERE id_asignacion_docente = :asig");
+        $stmtExistentes->execute([':asig' => $idAsignacionDocente]);
+        $existentes = array_flip($stmtExistentes->fetchAll(PDO::FETCH_COLUMN));
+
+        // Continúa la numeración después del número más alto ya usado
+        // (si los números existentes no son todos numéricos, ej. porque
+        // se escribieron a mano como "3-A", simplemente empieza en 1).
+        $stmtMax = $db->prepare("SELECT numero_clase FROM tbl_clase_impartida WHERE id_asignacion_docente = :asig");
+        $stmtMax->execute([':asig' => $idAsignacionDocente]);
+        $siguienteNumero = 1;
+        foreach ($stmtMax->fetchAll(PDO::FETCH_COLUMN) as $n) {
+            if (ctype_digit((string) $n) && (int) $n >= $siguienteNumero) {
+                $siguienteNumero = (int) $n + 1;
+            }
+        }
+
+        $insert = $db->prepare(
+            "INSERT INTO tbl_clase_impartida (id_institucion, id_asignacion_docente, numero_clase, fecha_clase, estado, created_by)
+             VALUES (:tid, :asig, :num, :fecha, 'borrador', :creator)"
+        );
+
+        $creadas = 0;
+        $omitidas = 0;
+        $cursor = clone $inicio;
+        while ($cursor <= $fin) {
+            $diaSemana = (int) $cursor->format('N'); // 1=Lunes..7=Domingo, igual que dia_semana
+            $fechaStr = $cursor->format('Y-m-d');
+            if (in_array($diaSemana, $dias, true)) {
+                if (isset($existentes[$fechaStr])) {
+                    $omitidas++;
+                } else {
+                    $insert->execute([
+                        ':tid' => $tid, ':asig' => $idAsignacionDocente, ':num' => (string) $siguienteNumero,
+                        ':fecha' => $fechaStr, ':creator' => $userId,
+                    ]);
+                    $existentes[$fechaStr] = true;
+                    $siguienteNumero++;
+                    $creadas++;
+                }
+            }
+            $cursor->modify('+1 day');
+        }
+
+        return ['creadas' => $creadas, 'omitidas' => $omitidas];
+    }
 }
