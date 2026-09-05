@@ -200,6 +200,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
             if ($actividadActual && !empty($titulo)) {
                 $id_examen = $actividadActual['id_examen'] ?: null;
+                $preguntasBloqueadas = false;
 
                 // Mismo criterio que en ActividadHelper::crearActividadEnAsignacion():
                 // ya no se restringe a tarea/examen, cualquier tipo puede vincularse.
@@ -211,7 +212,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         throw new Exception('Un examen necesita al menos una pregunta');
                     }
                     if ($id_examen) {
-                        // Ya había un examen enlazado: actualizar y reemplazar sus preguntas.
+                        // Ya había un examen enlazado: actualizar sus metadatos siempre.
                         $stmtExamen = $db->prepare("UPDATE tbl_examen SET
                             titulo = :titulo, descripcion = :descripcion, duracion_minutos = :duracion,
                             nota_maxima = :nota_maxima, fecha_programada = :fecha_prog,
@@ -223,7 +224,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             ':fecha_limite' => $fecha_limite, ':estado' => ActividadHelper::mapEstadoActividadAExamen($estado),
                             ':id' => $id_examen
                         ]);
-                        $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id")->execute([':id' => $id_examen]);
+                        // Reemplazar las preguntas SOLO si todavía nadie lo ha tomado.
+                        // Si ya hay intentos (tbl_intento_examen), sus respuestas
+                        // (tbl_respuesta_estudiante) referencian por FK las preguntas
+                        // actuales (tbl_respuesta_estudiante_ibfk_2, sin ON DELETE) --
+                        // borrarlas tiraba "Cannot delete or update a parent row" (#1451).
+                        // Se deja el banco de preguntas intacto en ese caso; el resto de
+                        // los datos del examen sí se actualiza arriba.
+                        if (ActividadHelper::examenTieneIntentos($db, $id_examen)) {
+                            $preguntasBloqueadas = true;
+                        } else {
+                            $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id")->execute([':id' => $id_examen]);
+                            ActividadHelper::guardarPreguntasExamen($db, $id_examen, $preguntas);
+                        }
                     } else {
                         // La actividad no tenía examen enlazado todavía (p.ej. cambió de
                         // tipo "tarea" a "examen" al editar): crear uno nuevo.
@@ -238,8 +251,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                             ':estado' => ActividadHelper::mapEstadoActividadAExamen($estado)
                         ]);
                         $id_examen = (int) $db->lastInsertId();
+                        ActividadHelper::guardarPreguntasExamen($db, $id_examen, $preguntas);
                     }
-                    ActividadHelper::guardarPreguntasExamen($db, $id_examen, $preguntas);
                 } else {
                     // Ya no es tipo "examen": se desvincula (el examen real, si
                     // existía y ya tiene intentos de estudiantes, no se borra).
@@ -277,6 +290,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                 $db->commit();
                 $mensaje = 'Actividad actualizada exitosamente';
                 $tipo_mensaje = 'success';
+                if ($preguntasBloqueadas) {
+                    $mensaje .= ' (las preguntas del examen NO se modificaron porque ya hay estudiantes con intentos registrados; el resto de los datos sí se actualizó)';
+                    $tipo_mensaje = 'warning';
+                }
             } else {
                 throw new Exception("No tiene permiso para editar esta actividad");
             }
@@ -684,7 +701,7 @@ require __DIR__ . '/partials/header.php';
                     <p class="text-muted small mb-2"><?= nl2br(htmlspecialchars(substr($act['descripcion'], 0, 100))) ?><?= strlen($act['descripcion']) > 100 ? '...' : '' ?></p>
                     <?php endif; ?>
                     <div class="d-flex justify-content-between align-items-center small text-muted">
-                        <span><i class="fas fa-calendar"></i> <?= date('d/m/Y', strtotime($act['fecha_programada'])) ?></span>
+                        <span><i class="fas fa-calendar"></i> <?= $act['fecha_programada'] ? date('d/m/Y', strtotime($act['fecha_programada'])) : 'Sin fecha' ?></span>
                         <?php if ($act['fecha_limite']): ?>
                         <span><i class="fas fa-clock"></i> <?= date('d/m', strtotime($act['fecha_limite'])) ?></span>
                         <?php endif; ?>
@@ -775,9 +792,16 @@ require __DIR__ . '/partials/header.php';
                             <!-- Generador de preguntas (sólo tipo = examen) -->
                             <div id="bloque_examen" class="col-12 d-none">
                                 <hr>
+                                <div id="alerta_examen_con_intentos" class="alert alert-warning d-none">
+                                    <i class="fas fa-exclamation-triangle"></i>
+                                    Este examen ya tiene estudiantes con intentos registrados. Puedes seguir editando
+                                    el título, las fechas y el estado, pero <strong>las preguntas no se pueden modificar</strong>
+                                    (se perderían las respuestas y notas ya guardadas de esos estudiantes). Los cambios que
+                                    hagas abajo en las preguntas no se guardarán.
+                                </div>
                                 <div class="d-flex justify-content-between align-items-center mb-2">
                                     <label class="form-label mb-0"><i class="fas fa-list-ol"></i> Preguntas del examen *</label>
-                                    <button type="button" class="btn btn-sm btn-outline-primary" onclick="agregarPreguntaExamen()">
+                                    <button type="button" id="btn_agregar_pregunta_examen" class="btn btn-sm btn-outline-primary" onclick="agregarPreguntaExamen()">
                                         <i class="fas fa-plus"></i> Agregar pregunta
                                     </button>
                                 </div>
@@ -862,6 +886,8 @@ require __DIR__ . '/partials/header.php';
             // siempre edita UNA actividad puntual) -- form.reset() ya deja
             // #publicar_a en su valor 'seccion' por defecto.
             document.getElementById('bloque_publicar_a').classList.remove('d-none');
+            document.getElementById('alerta_examen_con_intentos').classList.add('d-none');
+            document.getElementById('btn_agregar_pregunta_examen').disabled = false;
             vaciarPreguntasExamen();
             mostrarCamposTipo();
         }
@@ -911,6 +937,17 @@ require __DIR__ . '/partials/header.php';
             if (act.tipo === 'examen' && Array.isArray(preguntas)) {
                 preguntas.forEach(p => agregarPreguntaExamen(p));
             }
+
+            // Si el examen ya tiene intentos de estudiantes, el servidor
+            // ignora cualquier cambio a las preguntas (ver ActividadHelper::
+            // examenTieneIntentos) para no romper las respuestas/notas ya
+            // registradas -- se avisa aquí y se deshabilita la edición para
+            // que no parezca que el cambio se guardó cuando no fue así.
+            const examenBloqueado = act.tipo === 'examen' && Number(act.total_intentos_examen || 0) > 0;
+            document.getElementById('alerta_examen_con_intentos').classList.toggle('d-none', !examenBloqueado);
+            document.getElementById('btn_agregar_pregunta_examen').disabled = examenBloqueado;
+            document.querySelectorAll('#preguntas_examen_container input, #preguntas_examen_container select, #preguntas_examen_container textarea, #preguntas_examen_container button')
+                .forEach(el => { el.disabled = examenBloqueado; });
 
             mostrarCamposTipo();
             new bootstrap.Modal(document.getElementById('modalActividad')).show();

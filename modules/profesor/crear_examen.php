@@ -2,6 +2,7 @@
 session_start();
 require_once __DIR__ . '/../../config/database.php';
 require_once __DIR__ . '/../../config/TenantGuard.php';
+require_once __DIR__ . '/../../config/ActividadHelper.php';
 
 if (!isset($_SESSION['user_id']) || $_SESSION['rol'] !== 'profesor') {
     header("Location: " . BASE_URL . "/login.php");
@@ -59,6 +60,11 @@ if ($examen_id) {
         $preguntas = $stmt->fetchAll(PDO::FETCH_ASSOC);
     }
 }
+// Igual que gestionar_actividades.php/api/guardar_examen.php: una vez que un
+// estudiante ya inició un intento, sus respuestas quedan ligadas por FK a las
+// preguntas actuales, así que "Guardar Examen" ya no las reemplaza (ver
+// ActividadHelper::examenTieneIntentos) -- se avisa aquí en el editor.
+$examenTieneIntentos = $examen ? ActividadHelper::examenTieneIntentos($db, (int) $examen_id) : false;
 $activePage = 'examen';
 $pageTitle = 'Crear Examen - Educación Plus';
 ob_start();
@@ -163,6 +169,15 @@ require __DIR__ . '/partials/header.php';
 
                 <!-- Selector de Tipo de Pregunta -->
                 <div class="card-custom p-4 mt-4">
+                    <?php if ($examenTieneIntentos): ?>
+                    <div class="alert alert-warning">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        Este examen ya tiene estudiantes con intentos registrados. Puedes seguir editando el título,
+                        fechas y demás configuración con "Guardar Examen", pero <strong>las preguntas ya no se pueden
+                        modificar</strong> (se perderían las respuestas y notas ya guardadas de esos estudiantes). Los
+                        cambios que hagas abajo en las preguntas no se guardarán.
+                    </div>
+                    <?php endif; ?>
                     <h5 class="mb-3"><i class="fas fa-plus-circle"></i> Agregar Pregunta</h5>
                     <div class="question-type-selector">
                         <button type="button" class="type-btn" onclick="agregarPregunta('opcion_multiple')">
@@ -459,7 +474,7 @@ require __DIR__ . '/partials/header.php';
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    alert('Examen guardado exitosamente');
+                    alert(data.message || 'Examen guardado exitosamente');
                     if (data.examen_id && !<?= $examen_id ?>) {
                         window.location.href = '?asignacion=<?= $id_asignacion ?>&examen=' + data.examen_id;
                     }

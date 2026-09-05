@@ -2,6 +2,7 @@
 session_start();
 require_once __DIR__ . '/../../../config/database.php';
 require_once __DIR__ . '/../../../config/TenantGuard.php';
+require_once __DIR__ . '/../../../config/ActividadHelper.php';
 
 header('Content-Type: application/json');
 
@@ -53,6 +54,7 @@ try {
     }
 
     // Guardar examen
+    $preguntasBloqueadas = false;
     if (!empty($_POST['examen_id'])) {
         $examen_id = (int) $_POST['examen_id'];
 
@@ -82,8 +84,18 @@ try {
             ':id' => $examen_id, ':asig' => $id_asignacion
         ]);
 
-        // Eliminar preguntas existentes (el examen ya fue verificado como propio)
-        $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id")->execute([':id' => $examen_id]);
+        // Eliminar preguntas existentes SOLO si todavía nadie lo ha tomado.
+        // Si ya hay intentos (tbl_intento_examen), sus respuestas
+        // (tbl_respuesta_estudiante) referencian por FK las preguntas
+        // actuales (tbl_respuesta_estudiante_ibfk_2, sin ON DELETE) -- borrarlas
+        // tiraba "Cannot delete or update a parent row" (#1451). En ese caso se
+        // deja el banco de preguntas intacto (el resto del examen sí se actualizó
+        // arriba) y se omite el bloque de "Guardar preguntas" de abajo.
+        if (ActividadHelper::examenTieneIntentos($db, $examen_id)) {
+            $preguntasBloqueadas = true;
+        } else {
+            $db->prepare("DELETE FROM tbl_pregunta_examen WHERE id_examen = :id")->execute([':id' => $examen_id]);
+        }
     } else {
         // Crear nuevo. tbl_examen no tiene columna id_institucion (se
         // confirmó contra el esquema real) — insertarla aquí rompía CADA
@@ -103,10 +115,10 @@ try {
         $examen_id = $db->lastInsertId();
     }
     
-    // Guardar preguntas
-    $preguntas = $_POST['pregunta'] ?? [];
+    // Guardar preguntas (se omite por completo si $preguntasBloqueadas: ver arriba)
+    $preguntas = $preguntasBloqueadas ? [] : ($_POST['pregunta'] ?? []);
     $orden = 1;
-    
+
     foreach ($preguntas as $num => $preg) {
         $enunciado = trim($preg['enunciado'] ?? '');
         $tipo = determinarTipoPregunta($preg);
@@ -202,7 +214,11 @@ try {
     }
 
     $db->commit();
-    echo json_encode(['success' => true, 'examen_id' => $examen_id, 'message' => 'Examen guardado']);
+    $mensajeOk = 'Examen guardado';
+    if ($preguntasBloqueadas) {
+        $mensajeOk .= ' (las preguntas no se modificaron: ya hay estudiantes con intentos registrados)';
+    }
+    echo json_encode(['success' => true, 'examen_id' => $examen_id, 'message' => $mensajeOk, 'preguntas_bloqueadas' => $preguntasBloqueadas]);
     
 } catch (Exception $e) {
     $db->rollBack();

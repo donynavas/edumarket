@@ -128,6 +128,25 @@ class ActividadHelper
     }
 
     /**
+     * true si al menos un estudiante ya inició un intento de este examen
+     * (tbl_intento_examen). Usado antes de borrar/reemplazar sus preguntas
+     * (tbl_pregunta_examen): una vez que existe un intento, sus respuestas
+     * individuales (tbl_respuesta_estudiante) referencian esas preguntas por
+     * FK (tbl_respuesta_estudiante_ibfk_2, SIN ON DELETE) -- borrarlas rompe
+     * la base de datos con "Cannot delete or update a parent row" (#1451) y,
+     * aunque no rompiera, perdería silenciosamente las respuestas/notas ya
+     * registradas del estudiante. Llamado desde gestionar_actividades.php y
+     * modules/profesor/api/guardar_examen.php (los dos lugares donde se
+     * edita un examen ya existente).
+     */
+    public static function examenTieneIntentos(PDO $db, int $id_examen): bool
+    {
+        $stmt = $db->prepare("SELECT COUNT(*) FROM tbl_intento_examen WHERE id_examen = :id");
+        $stmt->execute([':id' => $id_examen]);
+        return ((int) $stmt->fetchColumn()) > 0;
+    }
+
+    /**
      * Resuelve y valida la vinculación opcional de una actividad al Cuadro de
      * Notas (tbl_actividad.id_periodo/bloque_notas/numero_nota). $idAsignacion
      * es la asignación REAL de la actividad (nunca la del filtro de la URL).
